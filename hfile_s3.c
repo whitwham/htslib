@@ -45,6 +45,8 @@ typedef struct {
     kstring_t token;
     kstring_t secret;
     kstring_t region;
+    kstring_t canonical_query_string;
+    kstring_t host_base;
     char *bucket;
     char *canonical_uri;
     kstring_t auth_hdr;
@@ -462,10 +464,7 @@ typedef struct {
     s3_auth_data *ad;
     kstring_t buffer;
     kstring_t url;
-    kstring_t host_base;
     kstring_t token_hdr;
-    char *http_request;
-    kstring_t canonical_query_string;
     kstring_t upload_id;
     kstring_t completion_message;
     int part_no;
@@ -497,7 +496,7 @@ static void kfree(kstring_t *s) {
 }
 
 
-static int make_signature(hFILE_s3_write *fp, kstring_t *string_to_sign, char *signature_string) {
+static int make_signature(s3_auth_data *ad, kstring_t *string_to_sign, char *signature_string) {
     unsigned char date_key[SHA256_DIGEST_LENGTH];
     unsigned char date_region_key[SHA256_DIGEST_LENGTH];
     unsigned char date_region_service_key[SHA256_DIGEST_LENGTH];
@@ -511,14 +510,14 @@ static int make_signature(hFILE_s3_write *fp, kstring_t *string_to_sign, char *s
     unsigned int len;
     unsigned int i, j;
     
-    ksprintf(&secret_access_key, "AWS4%s", fp->ad->secret.s);
+    ksprintf(&secret_access_key, "AWS4%s", ad->secret.s);
     
     if (secret_access_key.l == 0) {
         return -1;
     }
 
-    s3_sign_sha256(secret_access_key.s, secret_access_key.l, (const unsigned char *)fp->ad->date_short, strlen(fp->ad->date_short), date_key, &len);
-    s3_sign_sha256(date_key, len, (const unsigned char *)fp->ad->region.s, fp->ad->region.l, date_region_key, &len); 
+    s3_sign_sha256(secret_access_key.s, secret_access_key.l, (const unsigned char *)ad->date_short, strlen(ad->date_short), date_key, &len);
+    s3_sign_sha256(date_key, len, (const unsigned char *)ad->region.s, ad->region.l, date_region_key, &len); 
     s3_sign_sha256(date_region_key, len, service, 2, date_region_service_key, &len); 
     s3_sign_sha256(date_region_service_key, len, request, 12, signing_key, &len); 
     s3_sign_sha256(signing_key, len, (const unsigned char *)string_to_sign->s, string_to_sign->l, signature, &len);
@@ -533,7 +532,7 @@ static int make_signature(hFILE_s3_write *fp, kstring_t *string_to_sign, char *s
 }
 
 
-static int make_authorisation(hFILE_s3_write *fp, char *content, kstring_t *auth) {
+static int make_authorisation(s3_auth_data *ad, char *http_request, char *content, kstring_t *auth) {
     kstring_t signed_headers = {0, 0, NULL};
     kstring_t canonical_headers = {0, 0, NULL};
     kstring_t canonical_request = {0, 0, NULL};
@@ -549,14 +548,14 @@ static int make_authorisation(hFILE_s3_write *fp, char *content, kstring_t *auth
     }
     
     ksprintf(&canonical_headers, "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
-        fp->host_base.s, content, fp->ad->date_long);
+        ad->host_base.s, content, ad->date_long);
         
     if (canonical_headers.l == 0) {
         return -1;
     }
     
     ksprintf(&canonical_request, "%s\n/%s\n%s\n%s\n%s\n%s",
-        fp->http_request, fp->ad->canonical_uri, fp->canonical_query_string.s,
+        http_request, ad->canonical_uri, ad->canonical_query_string.s,
         canonical_headers.s, signed_headers.s, content);
         
     if (canonical_request.l == 0) {
@@ -565,24 +564,24 @@ static int make_authorisation(hFILE_s3_write *fp, char *content, kstring_t *auth
 
     hash_string(canonical_request.s, canonical_request.l, cr_hash);
     
-    ksprintf(&scope, "%s/%s/s3/aws4_request", fp->ad->date_short, fp->ad->region.s);
+    ksprintf(&scope, "%s/%s/s3/aws4_request", ad->date_short, ad->region.s);
     
     if (scope.l == 0) {
         return -1;
     }
     
-    ksprintf(&string_to_sign, "AWS4-HMAC-SHA256\n%s\n%s\n%s", fp->ad->date_long, scope.s, cr_hash);
+    ksprintf(&string_to_sign, "AWS4-HMAC-SHA256\n%s\n%s\n%s", ad->date_long, scope.s, cr_hash);
     
     if (string_to_sign.l == 0) {
         return -1;
     }
     
-    if (make_signature(fp, &string_to_sign, signature_string)) {
+    if (make_signature(ad, &string_to_sign, signature_string)) {
         return -1;
     }
     
     ksprintf(auth, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/%s/s3/aws4_request,SignedHeaders=%s,Signature=%s",
-                fp->ad->id.s, fp->ad->date_short, fp->ad->region.s, signed_headers.s, signature_string);
+                ad->id.s, ad->date_short, ad->region.s, signed_headers.s, signature_string);
                 
     if (auth->l == 0) {
         return -1;
@@ -635,27 +634,26 @@ static int abort_upload(hFILE_s3_write *fp) {
     kstring_t content = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
+    char http_request[] = "DELETE";
 
-    fp->http_request = "DELETE";
-
-    if (ksprintf(&fp->canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
+    if (ksprintf(&fp->ad->canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
         return -1;
     }    
 
     hash_string("", 0, content_hash); // empty hash
     
-    if (make_authorisation(fp, content_hash, &authorisation)) {
+    if (make_authorisation(fp->ad, http_request, content_hash, &authorisation)) {
         return -1;
     }
     
-    if (ksprintf(&url, "%s?%s", fp->url.s, fp->canonical_query_string.s) < 0) {
+    if (ksprintf(&url, "%s?%s", fp->url.s, fp->ad->canonical_query_string.s) < 0) {
         return -1;
     }
     
     ksprintf(&content, "x-amz-content-sha256: %s", content_hash);
 
     curl_easy_reset(fp->curl);
-    curl_easy_setopt(fp->curl, CURLOPT_CUSTOMREQUEST, fp->http_request);
+    curl_easy_setopt(fp->curl, CURLOPT_CUSTOMREQUEST, http_request);
     curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, "andy_write_test");
     curl_easy_setopt(fp->curl, CURLOPT_URL, url.s);
     
@@ -670,7 +668,7 @@ static int abort_upload(hFILE_s3_write *fp) {
        
     kfree(&authorisation);
     kfree(&content);
-    kfree(&fp->canonical_query_string);    
+    kfree(&fp->ad->canonical_query_string);    
     curl_slist_free_all(headers);
     
     return ret;
@@ -684,17 +682,17 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
     kstring_t content = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
+    char http_request[] = "POST";
     
-    fp->http_request = "POST";
-    kputs("uploads=", &fp->canonical_query_string);
+    kputs("uploads=", &fp->ad->canonical_query_string);
     
-    if (fp->canonical_query_string.l == 0) {
+    if (fp->ad->canonical_query_string.l == 0) {
         return -1;
     }
     
     hash_string("", 0, content_hash); // empty hash
     
-    if (make_authorisation(fp, content_hash, &authorisation)) {
+    if (make_authorisation(fp->ad, http_request, content_hash, &authorisation)) {
         return -1;
     }
     
@@ -730,7 +728,7 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
        
     kfree(&authorisation);
     kfree(&content);
-    kfree(&fp->canonical_query_string);    
+    kfree(&fp->ad->canonical_query_string);    
     curl_slist_free_all(headers);
     
     return ret;    
@@ -740,7 +738,7 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
 static int redirect_endpoint(hFILE_s3_write *fp, kstring_t *head, char *bucket) {
     int ret = 0;
     
-    if (strstr(fp->host_base.s, "amazonaws.com")) {
+    if (strstr(fp->ad->host_base.s, "amazonaws.com")) {
         char *new_region;
         char *end;
         
@@ -758,15 +756,15 @@ static int redirect_endpoint(hFILE_s3_write *fp, kstring_t *head, char *bucket) 
         fp->ad->region.l = 0;
         kputs(new_region, &fp->ad->region);
         
-        fp->host_base.l = 0;
-        ksprintf(&fp->host_base, "s3.%s.amazonaws.com", new_region);
+        fp->ad->host_base.l = 0;
+        ksprintf(&fp->ad->host_base, "s3.%s.amazonaws.com", new_region);
         
         if (fp->ad->region.l == 0) {
             ret = -1;
         }
         
         fp->url.l = 0;
-        kputs(fp->host_base.s, &fp->url);
+        kputs(fp->ad->host_base.s, &fp->url);
         kputc('/', &fp->url);
         kputsn(bucket, strlen(bucket), &fp->url);
         
@@ -833,20 +831,19 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
     kstring_t content = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
+    char http_request[] = "PUT";
     
-    fp->http_request = "PUT";
-    
-    if (ksprintf(&fp->canonical_query_string, "partNumber=%d&uploadId=%s", fp->part_no, fp->upload_id.s) < 0) {
+    if (ksprintf(&fp->ad->canonical_query_string, "partNumber=%d&uploadId=%s", fp->part_no, fp->upload_id.s) < 0) {
         return -1;
     }
     
     hash_string(fp->buffer.s, fp->buffer.l, content_hash);
     
-    if (make_authorisation(fp, content_hash, &authorisation)) {
+    if (make_authorisation(fp->ad, http_request, content_hash, &authorisation)) {
         return -1;
     }
     
-    if (ksprintf(&url, "%s?%s", fp->url.s, fp->canonical_query_string.s) < 0) {
+    if (ksprintf(&url, "%s?%s", fp->url.s, fp->ad->canonical_query_string.s) < 0) {
         return -1;
     }
     
@@ -875,7 +872,7 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
        
     kfree(&authorisation);
     kfree(&content);
-    kfree(&fp->canonical_query_string);    
+    kfree(&fp->ad->canonical_query_string);    
     curl_slist_free_all(headers);
     
     return ret;    
@@ -939,10 +936,9 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     kstring_t content = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
-
-    fp->http_request = "POST";
+    char http_request[] = "POST";
     
-    if (ksprintf(&fp->canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
+    if (ksprintf(&fp->ad->canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
         return -1;
     }
     
@@ -951,11 +947,11 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     
     hash_string(fp->completion_message.s, fp->completion_message.l, content_hash);
     
-    if (make_authorisation(fp, content_hash, &authorisation)) {
+    if (make_authorisation(fp->ad, http_request, content_hash, &authorisation)) {
         return -1;
     }
     
-    if (ksprintf(&url, "%s?%s", fp->url.s, fp->canonical_query_string.s) < 0) {
+    if (ksprintf(&url, "%s?%s", fp->url.s, fp->ad->canonical_query_string.s) < 0) {
         return -1;
     }
     
@@ -981,7 +977,7 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
        
     kfree(&authorisation);
     kfree(&content);
-    kfree(&fp->canonical_query_string);    
+    kfree(&fp->ad->canonical_query_string);    
     curl_slist_free_all(headers);
     
     return ret;
@@ -1071,9 +1067,7 @@ static hFILE *s3_open_for_writing(char *s3url, va_list *argsp) {
     
     kinit(&fp->buffer);
     kinit(&fp->url);
-    kinit(&fp->host_base);
     kinit(&fp->token_hdr);
-    kinit(&fp->canonical_query_string);
     
     err = curl_global_init(CURL_GLOBAL_ALL);  // FIXME possibly called twice (with hfile_libcurl)
     
@@ -1146,13 +1140,13 @@ static hFILE *s3_open_for_writing(char *s3url, va_list *argsp) {
     if (fp->ad->id.l == 0)
         parse_ini("~/.s3cfg", profile.s, "access_key", &fp->ad->id,
                   "secret_key", &fp->ad->secret, "access_token", &fp->ad->token,
-                  "host_base", &fp->host_base,
+                  "host_base", &fp->ad->host_base,
                   "bucket_location", &fp->ad->region, NULL);
     if (fp->ad->id.l == 0)
         parse_simple("~/.awssecret", &fp->ad->id, &fp->ad->secret);
 
-    if (fp->host_base.l == 0)
-        kputs("s3.amazonaws.com", &fp->host_base);
+    if (fp->ad->host_base.l == 0)
+        kputs("s3.amazonaws.com", &fp->ad->host_base);
         
     if (fp->ad->region.l == 0)
         kputs("us-east-1", &fp->ad->region);
@@ -1161,7 +1155,7 @@ static hFILE *s3_open_for_writing(char *s3url, va_list *argsp) {
     /* use path-style url as virtual hosted-style has the possibility
        of breaking ssl certificates if there is a dot in the bucket name */
        
-    kputs(fp->host_base.s, &fp->url);
+    kputs(fp->ad->host_base.s, &fp->url);
     kputc('/', &fp->url);
     kputsn(bucket, strlen(bucket), &fp->url);
 
@@ -1233,19 +1227,193 @@ error:
 }
 
 
+static int v4_auth_header_callback(void *ctx, char ***hdrs) {
+    s3_auth_data *ad = (s3_auth_data *) ctx;
+    char content_hash[HASH_LENGTH_SHA256];
+    kstring_t content = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+    
+    fprintf(stderr, "GOT HERE FIRST!!\n");
+    
+    if (!hdrs) { // Closing connection
+        free_auth_data(ad);
+        return 0;
+    }
+    
+    fprintf(stderr, "GOT HERE!\n");
+    
+    hash_string("", 0, content_hash); // empty hash
+    
+    if (make_authorisation(ad, "GET", content_hash, &authorisation)) {
+        return -1;
+    }
+    
+    ksprintf(&content, "x-amz-content-sha256: %s", content_hash);
+    
+    if (content.l == 0) {
+        return -1;
+    }
+    
+    {
+        char **hdr = &ad->headers[0];
+        *hdrs = hdr;
+        *hdr = strdup(authorisation.s);
+        hdr++;
+        *hdr = strdup(ad->date_html.s);
+        hdr++;
+        *hdr = strdup(content.s);
+        hdr++;
+        *hdr = NULL;
+    }
+    
+    return 0;
+}
+     
+    
+
+
+static hFILE *s3_open_for_reading(char *s3url, const char *mode, va_list *argsp) {
+    kstring_t profile  = {0, 0, NULL};
+    kstring_t url = { 0, 0, NULL };
+    kstring_t host_base = { 0, 0, NULL };
+    kstring_t token_hdr = { 0, 0, NULL };
+    
+    char *bucket, *path;
+    struct tm *base_time;
+    int ret;
+    char *header_list[4], **header = header_list;
+    s3_auth_data *ad;
+
+    if ((ad = calloc(1, sizeof(s3_auth_data))) == NULL) {
+        goto error;
+    }
+    
+    ad->mode = 'r';
+    
+    if (s3url[2] == '+') {
+        bucket = strchr(s3url, ':') + 1;
+        kputsn(&s3url[3], bucket - &s3url[3], &url);
+    }
+    else {
+        kputs("https:", &url);
+        bucket = &s3url[3];
+    }    
+    
+    while (*bucket == '/') kputc(*bucket++, &url);
+
+    path = bucket + strcspn(bucket, "/?#@");
+    
+    if (*path == '@') {
+        const char *colon = strpbrk(bucket, ":@");
+        if (*colon != ':') {
+            urldecode_kput(bucket, colon - bucket, &profile);
+        }
+        else {
+            const char *colon2 = strpbrk(&colon[1], ":@");
+            urldecode_kput(bucket, colon - bucket, &ad->id);
+            urldecode_kput(&colon[1], colon2 - &colon[1], &ad->secret);
+            if (*colon2 == ':')
+                urldecode_kput(&colon2[1], path - &colon2[1], &ad->token);
+        }
+
+        bucket = &path[1];
+        path = bucket + strcspn(bucket, "/?#");
+    }
+    else {
+        // If the URL has no ID[:SECRET]@, consider environment variables.
+        const char *v;
+        if ((v = getenv("AWS_ACCESS_KEY_ID")) != NULL) kputs(v, &ad->id);
+        if ((v = getenv("AWS_SECRET_ACCESS_KEY")) != NULL) kputs(v, &ad->secret);
+        if ((v = getenv("AWS_SESSION_TOKEN")) != NULL) kputs(v, &ad->token);
+        if ((v = getenv("AWS_DEFAULT_REGION")) != NULL) kputs(v, &ad->region);
+
+        if ((v = getenv("AWS_DEFAULT_PROFILE")) != NULL) kputs(v, &profile);
+        else if ((v = getenv("AWS_PROFILE")) != NULL) kputs(v, &profile);
+        else kputs("default", &profile);
+    }
+    
+    if (ad->id.l == 0) {
+        const char *v = getenv("AWS_SHARED_CREDENTIALS_FILE");
+        parse_ini(v? v : "~/.aws/credentials", profile.s,
+                  "aws_access_key_id", &ad->id,
+                  "aws_secret_access_key", &ad->secret,
+                  "aws_session_token", &ad->token,
+                  "region", &ad->region, NULL);
+    }
+    
+    if (ad->id.l == 0)
+        parse_ini("~/.s3cfg", profile.s, "access_key", &ad->id,
+                  "secret_key", &ad->secret, "access_token", &ad->token,
+                  "host_base", &ad->host_base,
+                  "bucket_location", &ad->region, NULL);
+    if (ad->id.l == 0)
+        parse_simple("~/.awssecret", &ad->id, &ad->secret);
+
+    if (ad->host_base.l == 0)
+        kputs("s3.amazonaws.com", &ad->host_base);
+        
+    if (ad->region.l == 0)
+        kputs("us-east-1", &ad->region);
+    
+    
+    /* use path-style url as virtual hosted-style has the possibility
+       of breaking ssl certificates if there is a dot in the bucket name */
+       
+    kputs(ad->host_base.s, &url);
+    kputc('/', &url);
+    kputsn(bucket, strlen(bucket), &url);
+
+    
+    ad->canonical_uri = bucket;
+    kputs("", &ad->canonical_query_string);
+    
+    if ((ad->bucket = strdup(bucket)) == NULL) {
+        goto error;
+    }
+    
+    // FIXME look at doing something with a token
+    
+    // set up the time, look at keeping this updated
+    ad->auth_time = time(NULL);
+    base_time = gmtime(&ad->auth_time);
+    
+    if (strftime(ad->date_long, 17, "%Y%m%dT%H%M%SZ", base_time) != 16) {
+        goto error;
+    }
+    
+    if (strftime(ad->date_short, 9, "%Y%m%d", base_time) != 8) {
+        goto error;
+    }
+    
+    ksprintf(&ad->date_html, "x-amz-date: %s", ad->date_long);
+    
+    fprintf(stderr, "ABOUT TO CALL hopen on %s\n", url.s);
+    
+    *header = NULL;
+    hFILE *fp = hopen(url.s, mode, "va_list", argsp, "httphdr:v", header_list,
+                      "httphdr_callback", v4_auth_header_callback,
+                      "httphdr_callback_data", ad, NULL);
+
+    return fp;
+    
+    
+error:
+    
+    // do some cleaning up here
+    return NULL;
+}
+
 static hFILE *s3_open(const char *url, const char *mode)
 {
     hFILE *fp;
 
-    kstring_t mode_colon = { 0, 0, NULL };
-    
     if (strchr(mode, 'w')) {
-        fp = s3_open_for_writing(url, NULL);
+       fp = s3_open_for_writing(url, NULL);
     } else {
        kstring_t mode_colon = { 0, 0, NULL };
        kputs(mode, &mode_colon);
        kputc(':', &mode_colon);
-       fp = s3_rewrite(url, mode_colon.s, NULL);
+       fp = s3_open_for_reading(url, mode_colon.s, NULL);
        free(mode_colon.s);
     }
     
