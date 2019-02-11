@@ -75,11 +75,14 @@ typedef struct {
     unsigned int size;
 } hdrlist;
 
+typedef int (*redirect_callback) (void *auth_data, kstring_t*, kstring_t*);
+
 typedef struct {
     hdrlist fixed;                   // List of headers supplied at hopen()
     hdrlist extra;                   // List of headers from callback
     hts_httphdr_callback callback;   // Callback to get more headers
     void *callback_data;             // Data to pass to callback
+    redirect_callback redirect;
     auth_token *auth;                // Authentication token
     int auth_hdr_num;                // Location of auth_token in hdrlist extra
                                      // If -1, Authorization header is in fixed
@@ -109,6 +112,7 @@ typedef struct {
     unsigned tried_seek : 1; // At least one seek has been attempted
     int nrunning;
     http_headers headers;
+    
     off_t delayed_seek;      // Location to seek to before reading
     off_t last_offset;       // Location we're seeking from
 } hFILE_libcurl;
@@ -721,8 +725,11 @@ static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv)
 {
     hFILE_libcurl *fp = (hFILE_libcurl *) fpv;
     size_t n = size * nmemb;
-
-    if (n > fp->buffer.len) { fp->paused = 1; return CURL_WRITEFUNC_PAUSE; }
+    
+    if (n > fp->buffer.len) {
+        fp->paused = 1;
+        return CURL_WRITEFUNC_PAUSE;
+    }
     else if (n == 0) return 0;
 
     memcpy(fp->buffer.ptr.rd, ptr, n);
@@ -731,6 +738,19 @@ static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv)
     return n;
 }
 
+
+size_t header_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    kstring_t *resp = (kstring_t *)userp;
+
+    if (kputsn((const char *)contents, realsize, resp) == EOF) {
+        return 0;
+    }    
+    
+    return realsize;
+}
+
+
 static ssize_t libcurl_read(hFILE *fpv, void *bufferv, size_t nbytes)
 {
     hFILE_libcurl *fp = (hFILE_libcurl *) fpv;
@@ -738,7 +758,7 @@ static ssize_t libcurl_read(hFILE *fpv, void *bufferv, size_t nbytes)
     off_t to_skip = -1;
     ssize_t got = 0;
     CURLcode err;
-
+    
     if (fp->delayed_seek >= 0) {
         assert(fp->base.offset == fp->delayed_seek
                && fp->base.begin == fp->base.buffer
@@ -766,8 +786,9 @@ static ssize_t libcurl_read(hFILE *fpv, void *bufferv, size_t nbytes)
         err = curl_easy_pause(fp->easy, CURLPAUSE_CONT);
         if (err != CURLE_OK) { errno = easy_errno(fp->easy, err); return -1; }
 
-        while (! fp->paused && ! fp->finished)
+        while (! fp->paused && ! fp->finished) {
             if (wait_perform(fp) < 0) return -1;
+        }
 
         got = fp->buffer.ptr.rd - buffer;
 
@@ -785,7 +806,7 @@ static ssize_t libcurl_read(hFILE *fpv, void *bufferv, size_t nbytes)
     } while (to_skip >= 0 && ! fp->finished);
     fp->buffer.ptr.rd = NULL;
     fp->buffer.len = 0;
-
+    
     if (fp->finished && fp->final_result != CURLE_OK) {
         errno = easy_errno(fp->easy, fp->final_result);
         return -1;
@@ -1089,7 +1110,8 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
     CURLcode err;
     CURLMcode errm;
     int save, is_recursive;
-
+    kstring_t in_header = {0, 0, NULL};
+    
     is_recursive = strchr(modes, 'R') != NULL;
 
     if ((s = strpbrk(modes, "rwa+")) != NULL) {
@@ -1170,6 +1192,11 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
         err |= curl_easy_setopt(fp->easy, CURLOPT_FAILONERROR, 1L);
     if (hts_verbose >= 8)
         err |= curl_easy_setopt(fp->easy, CURLOPT_VERBOSE, 1L);
+        
+    if (fp->headers.redirect) {
+        err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERFUNCTION, header_callback);
+        err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, (void *)&in_header);
+    }
 
     if (err != 0) { errno = ENOSYS; goto error; }
 
@@ -1177,9 +1204,10 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
     if (errm != CURLM_OK) { errno = multi_errno(errm); goto error; }
     fp->nrunning++;
 
-    while (! fp->paused && ! fp->finished)
+    while (! fp->paused && ! fp->finished) {
         if (wait_perform(fp) < 0) goto error_remove;
-
+    }
+    
     if (fp->finished && fp->final_result != CURLE_OK) {
         errno = easy_errno(fp->easy, fp->final_result);
         goto error_remove;
@@ -1187,6 +1215,34 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
 
     if (mode == 'r') {
         double dval;
+        long response;
+        
+        curl_easy_getinfo(fp->easy, CURLINFO_RESPONSE_CODE, &response);
+        
+        if (fp->headers.redirect && response == 301) { // PERMANENT_REDIRECT
+            kstring_t new_url = {0, 0, NULL};
+            
+            if (fp->headers.redirect(fp->headers.callback_data, &in_header, &new_url)) {
+                errno = ENOSYS;
+                goto error;
+            }
+            
+            err |= curl_easy_setopt(fp->easy, CURLOPT_URL, new_url.s);
+            err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERFUNCTION, NULL);
+            err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, NULL);
+            free(in_header.s);
+            
+            if (err != 0) { errno = ENOSYS; goto error; }
+            free(new_url.s);
+            
+            restart_from_position(fp, 0);
+
+            if (fp->finished && fp->final_result != CURLE_OK) {
+                errno = easy_errno(fp->easy, fp->final_result);
+                goto error_remove;
+            }
+        }
+
         if (curl_easy_getinfo(fp->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD,
                               &dval) == CURLE_OK && dval >= 0.0)
             fp->file_size = (off_t) (dval + 0.1);
@@ -1268,6 +1324,9 @@ static int parse_va_list(http_headers *headers, va_list args)
             if (strcmp(flag, "false") == 0)
                 headers->auth_hdr_num = -3;
         }
+        else if (strcmp(argtype, "redirect_callback") == 0) {
+            headers->redirect = va_arg(args, const redirect_callback);
+        }
         else { errno = EINVAL; return -1; }
 
     return 0;
@@ -1321,6 +1380,7 @@ static hFILE *vhopen_libcurl(const char *url, const char *modes, va_list args)
 {
     hFILE *fp = NULL;
     http_headers headers = { { NULL, 0, 0 }, { NULL, 0, 0 }, NULL, NULL };
+    
     if (parse_va_list(&headers, args) == 0) {
         fp = libcurl_open(url, modes, &headers);
     }
