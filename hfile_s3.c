@@ -47,7 +47,6 @@ typedef struct {
     kstring_t canonical_query_string;
     kstring_t host_base;
     char *bucket;
-    char *canonical_uri;
     kstring_t auth_hdr;
     time_t auth_time;
     char date[40];
@@ -65,6 +64,8 @@ typedef struct {
 #include <CommonCrypto/CommonHMAC.h>
 
 #define DIGEST_BUFSIZ CC_SHA1_DIGEST_LENGTH
+#define SHA256_DIGEST_BUFSIZE CC_SHA256_DIGEST_LENGTH
+#define HASH_LENGTH_SHA256 (SHA256_DIGEST_BUFSIZE * 2) + 1
 
 static size_t
 s3_sign(unsigned char *digest, kstring_t *key, kstring_t *message)
@@ -72,6 +73,18 @@ s3_sign(unsigned char *digest, kstring_t *key, kstring_t *message)
     CCHmac(kCCHmacAlgSHA1, key->s, key->l, message->s, message->l, digest);
     return CC_SHA1_DIGEST_LENGTH;
 }
+
+
+static void s3_sha256(const unsigned char *in, size_t length, unsigned char *out) {
+    CC_SHA256(in, length, out);
+}
+
+
+void char *s3_sign_sha256(const void *key, int key_len, const unsigned char *d, int n, unsigned char *md, unsigned int *md_len) {
+    CCHmac(kCCHmacAlgSHA256, key, key_len, d, n, md);
+    *md_len = CC_SHA256_DIGEST_LENGTH;
+}
+
 
 #elif defined HAVE_HMAC
 
@@ -97,8 +110,8 @@ static void s3_sha256(const unsigned char *in, size_t length, unsigned char *out
 }
 
 
-unsigned char *s3_sign_sha256(const void *key, int key_len, const unsigned char *d, int n, unsigned char *md, unsigned int *md_len) {
-    return HMAC(EVP_sha256(), key, key_len, d, n, md, md_len);
+void s3_sign_sha256(const void *key, int key_len, const unsigned char *d, int n, unsigned char *md, unsigned int *md_len) {
+    HMAC(EVP_sha256(), key, key_len, d, n, md, md_len);
 }
 
 #else
@@ -273,7 +286,6 @@ static void free_auth_data(s3_auth_data *ad) {
     free(ad->canonical_query_string.s);
     free(ad->host_base.s);
     free(ad->bucket);
-    free(ad->canonical_uri);
     free(ad->auth_hdr.s);
     free(ad->date_html.s);
     free(ad);
@@ -333,6 +345,56 @@ static int auth_header_callback(void *ctx, char ***hdrs) {
     free(message.s);
     return -1;
 }
+
+
+static char *escape_path(const char *path) {
+    size_t i, j = 0, length;
+    char *escaped;
+
+    length = strlen(path);
+
+    if ((escaped = malloc(length * 3)) == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < length; i++) {
+        int c = path[i];
+
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+             c == '_' || c == '-' || c == '~' || c == '.' || c == '/') {
+            sprintf(escaped + j, "%c", c);
+            j++;
+        } else {
+            sprintf(escaped + j, "%%%02X", c);
+            j += 3;
+        }
+    }
+
+    return escaped;
+}
+
+
+static int is_escaped(const char *str) {
+    size_t length = strlen(str);
+    size_t i = 0;
+    int escaped = 0;
+
+    while (str[i]) {
+        if (str[i] == '%' && i + 2 < length) {
+            if (isxdigit(str[i + 1]) && isxdigit(str[i + 2])) {
+                escaped = 1;
+            } else {
+                // only escaped if all % signes are escaped
+                escaped = 0;
+            }
+        }
+
+        i++;
+    }
+
+    return escaped;
+}
+
 
 static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
 {
@@ -457,8 +519,6 @@ AWS S3 sig version 4 writing code
 
 ****************************************************************/
 
-#define HASH_LENGTH (SHA256_DIGEST_LENGTH * 2) + 1
-
 static void hash_string(char *in, size_t length, char *out) {
     unsigned char hashed[SHA256_DIGEST_BUFSIZE];
     int i, j;
@@ -484,11 +544,11 @@ static void kfree(kstring_t *s) {
 
 
 static int make_signature(s3_auth_data *ad, kstring_t *string_to_sign, char *signature_string) {
-    unsigned char date_key[SHA256_DIGEST_LENGTH];
-    unsigned char date_region_key[SHA256_DIGEST_LENGTH];
-    unsigned char date_region_service_key[SHA256_DIGEST_LENGTH];
-    unsigned char signing_key[SHA256_DIGEST_LENGTH];
-    unsigned char signature[SHA256_DIGEST_LENGTH];
+    unsigned char date_key[SHA256_DIGEST_BUFSIZE];
+    unsigned char date_region_key[SHA256_DIGEST_BUFSIZE];
+    unsigned char date_region_service_key[SHA256_DIGEST_BUFSIZE];
+    unsigned char signing_key[SHA256_DIGEST_BUFSIZE];
+    unsigned char signature[SHA256_DIGEST_BUFSIZE];
     
     const unsigned char service[] = "s3";
     const unsigned char request[] = "aws4_request";
@@ -541,8 +601,10 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
         return -1;
     }
     
+    
+    // bucket == canonical_uri
     ksprintf(&canonical_request, "%s\n/%s\n%s\n%s\n%s\n%s",
-        http_request, ad->canonical_uri, ad->canonical_query_string.s,
+        http_request, ad->bucket, ad->canonical_query_string.s,
         canonical_headers.s, signed_headers.s, content);
         
     if (canonical_request.l == 0) {
@@ -647,7 +709,7 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
 }
 
 
-static redirect_endpoint_callback(void *auth, kstring_t *header, kstring_t *url) {
+static int redirect_endpoint_callback(void *auth, kstring_t *header, kstring_t *url) {
     s3_auth_data *ad = (s3_auth_data *)auth;
     char *new_region;
     char *end;
@@ -682,130 +744,6 @@ static redirect_endpoint_callback(void *auth, kstring_t *header, kstring_t *url)
     }
     
     return ret;
-}
-    
-
-static hFILE *s3_open_for_writing(const char *s3url, va_list *argsp) {
-    kstring_t profile   = {0, 0, NULL};
-    kstring_t final_url = {0, 0, NULL};
-    kstring_t url = {0, 0, NULL};
-    kstring_t token_hdr = {0, 0, NULL};
-    s3_auth_data *ad;
-    const char *bucket, *path;
-
-    if ((ad = calloc(1, sizeof(s3_auth_data))) == NULL) {
-        goto error;
-    }
-    
-    ad->mode = 'w';
-    
-    if (s3url[2] == '+') {
-        bucket = strchr(s3url, ':') + 1;
-        kputsn(&s3url[3], bucket - &s3url[3], &url);
-    }
-    else {
-        kputs("https:", &url);
-        bucket = &s3url[3];
-    }    
-    
-    while (*bucket == '/') kputc(*bucket++, &url);
-
-    path = bucket + strcspn(bucket, "/?#@");
-    
-    if (*path == '@') {
-        const char *colon = strpbrk(bucket, ":@");
-        if (*colon != ':') {
-            urldecode_kput(bucket, colon - bucket, &profile);
-        }
-        else {
-            const char *colon2 = strpbrk(&colon[1], ":@");
-            urldecode_kput(bucket, colon - bucket, &ad->id);
-            urldecode_kput(&colon[1], colon2 - &colon[1], &ad->secret);
-            if (*colon2 == ':')
-                urldecode_kput(&colon2[1], path - &colon2[1], &ad->token);
-        }
-
-        bucket = &path[1];
-        path = bucket + strcspn(bucket, "/?#");
-    }
-    else {
-        // If the URL has no ID[:SECRET]@, consider environment variables.
-        const char *v;
-        if ((v = getenv("AWS_ACCESS_KEY_ID")) != NULL) kputs(v, &ad->id);
-        if ((v = getenv("AWS_SECRET_ACCESS_KEY")) != NULL) kputs(v, &ad->secret);
-        if ((v = getenv("AWS_SESSION_TOKEN")) != NULL) kputs(v, &ad->token);
-        if ((v = getenv("AWS_DEFAULT_REGION")) != NULL) kputs(v, &ad->region);
-
-        if ((v = getenv("AWS_DEFAULT_PROFILE")) != NULL) kputs(v, &profile);
-        else if ((v = getenv("AWS_PROFILE")) != NULL) kputs(v, &profile);
-        else kputs("default", &profile);
-    }
-    
-    if (ad->id.l == 0) {
-        const char *v = getenv("AWS_SHARED_CREDENTIALS_FILE");
-        parse_ini(v? v : "~/.aws/credentials", profile.s,
-                  "aws_access_key_id", &ad->id,
-                  "aws_secret_access_key", &ad->secret,
-                  "aws_session_token", &ad->token,
-                  "region", &ad->region, NULL);
-    }
-    
-    if (ad->id.l == 0)
-        parse_ini("~/.s3cfg", profile.s, "access_key", &ad->id,
-                  "secret_key", &ad->secret, "access_token", &ad->token,
-                  "host_base", &ad->host_base,
-                  "bucket_location", &ad->region, NULL);
-    if (ad->id.l == 0)
-        parse_simple("~/.awssecret", &ad->id, &ad->secret);
-
-    if (ad->host_base.l == 0)
-        kputs("s3.amazonaws.com", &ad->host_base);
-        
-    if (ad->region.l == 0)
-        kputs("us-east-1", &ad->region);
-    
-    
-    /* use path-style url as virtual hosted-style has the possibility
-       of breaking ssl certificates if there is a dot in the bucket name */
-       
-    kputs(ad->host_base.s, &url);
-    kputc('/', &url);
-    kputsn(bucket, strlen(bucket), &url);
-
-    
-    ad->canonical_uri = strdup(bucket);
-    
-    if ((ad->bucket = strdup(bucket)) == NULL) {
-        goto error;
-    }
-    
-    // add the scheme marker
-    ksprintf(&final_url, "s3w+%s", url.s);
-    
-    if(final_url.l == 0) goto error;
-    
-    hFILE *fph = hopen(final_url.s, ":w", "va_list", argsp,
-                        "s3_auth_callback",  write_authorisation_callback,
-                        "s3_auth_callback_data", ad,
-                        "redirect_callback", redirect_endpoint_callback, NULL);
-                        
-    if (!fph) goto error;
-    
-    free(profile.s);
-    free(final_url.s);
-    free(url.s);
-    
-    return fph;
-    
-    
-
-  error:
-    
-    free(profile.s);
-    free(final_url.s);
-    free(url.s);
-
-    return NULL;
 }
 
 
@@ -873,25 +811,29 @@ static int v4_auth_header_callback(void *ctx, char ***hdrs) {
     return 0;
 }
      
-    
-static hFILE *s3_open_for_reading(const char *s3url, const char *mode, va_list *argsp) {
+
+static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     kstring_t profile  = {0, 0, NULL};
     kstring_t url = { 0, 0, NULL };
-    kstring_t host_base = { 0, 0, NULL };
     kstring_t token_hdr = { 0, 0, NULL };
     
     const char *bucket, *path;
-    struct tm *base_time;
-    int ret;
+    int read = 0;
     char *header_list[4], **header = header_list;
     s3_auth_data *ad;
+    hFILE *fp;
 
     if ((ad = calloc(1, sizeof(s3_auth_data))) == NULL) {
-        goto error;
+        return NULL;
     }
     
-    ad->mode = 'r';
-    
+    if (strchr(mode, 'r')) {
+        ad->mode = 'r';
+        read = 1;
+    } else {
+        ad->mode = 'w';
+    }
+
     if (s3url[2] == '+') {
         bucket = strchr(s3url, ':') + 1;
         kputsn(&s3url[3], bucket - &s3url[3], &url);
@@ -963,65 +905,81 @@ static hFILE *s3_open_for_reading(const char *s3url, const char *mode, va_list *
        
     kputs(ad->host_base.s, &url);
     kputc('/', &url);
-    kputsn(bucket, strlen(bucket), &url);
+    
+    if (is_escaped(bucket)) {
+        kputsn(bucket, strlen(bucket), &url);
 
-    
-    ad->canonical_uri = strdup(bucket);
-    kputs("", &ad->canonical_query_string);
-    
-    if ((ad->bucket = strdup(bucket)) == NULL) {
-        goto error;
-    }
-    
-    // FIXME look at doing something with a token
-    
-    // set up the time, look at keeping this updated
-    ad->auth_time = time(NULL);
-    base_time = gmtime(&ad->auth_time);
-    
-    if (strftime(ad->date_long, 17, "%Y%m%dT%H%M%SZ", base_time) != 16) {
-        goto error;
-    }
-    
-    if (strftime(ad->date_short, 9, "%Y%m%d", base_time) != 8) {
-        goto error;
-    }
-    
-    ksprintf(&ad->date_html, "x-amz-date: %s", ad->date_long);
-    
-    *header = NULL;
-    hFILE *fp = hopen(url.s, mode, "va_list", argsp, "httphdr:v", header_list,
-                      "httphdr_callback", v4_auth_header_callback,
-                      "httphdr_callback_data", ad,
-                      "redirect_callback", redirect_endpoint_callback, NULL);
+        if ((ad->bucket = strdup(bucket)) == NULL) {
+            goto error;
+        }
+    } else {
+        char *escaped_bucket = escape_path(bucket);
+        
+        if (escaped_bucket == NULL) goto error;
+        
+        kputsn(escaped_bucket, strlen(escaped_bucket), &url);
 
+        if ((ad->bucket = escape_path(bucket)) == NULL) {
+            goto error;
+        }
+        
+        free(escaped_bucket);
+    }
+    
+    if (read) {
+        kputs("", &ad->canonical_query_string);
+        
+        if (ad->token.l > 0) {
+            kputs("x-amz-security-token: ", &token_hdr);
+            kputs(ad->token.s, &token_hdr);
+            *header++ = token_hdr.s;
+        }
+        
+        *header = NULL;
+        fp = hopen(url.s, mode, "va_list", argsp, "httphdr:v", header_list,
+                          "httphdr_callback", v4_auth_header_callback,
+                          "httphdr_callback_data", ad,
+                          "redirect_callback", redirect_endpoint_callback, NULL);
+    } else {
+        kstring_t final_url = {0, 0, NULL};
+    
+         // add the scheme marker
+        ksprintf(&final_url, "s3w+%s", url.s);
+
+        if(final_url.l == 0) goto error;
+
+        fp = hopen(final_url.s, mode, "va_list", argsp,
+                            "s3_auth_callback",  write_authorisation_callback,
+                            "s3_auth_callback_data", ad,
+                            "redirect_callback", redirect_endpoint_callback, NULL);
+        free(final_url.s);
+    }
+    
     free(profile.s);
     free(url.s);
-
+    free(token_hdr.s);
+    
     return fp;
     
-error:
+  error:
     
-    // do some cleaning up here
     free(profile.s);
     free(url.s);
-    
+    free(token_hdr.s);
+
     return NULL;
-}
+}   
+    
 
 static hFILE *s3_open(const char *url, const char *mode)
 {
     hFILE *fp;
 
-    if (strchr(mode, 'w')) {
-       fp = s3_open_for_writing(url, NULL);
-    } else {
-       kstring_t mode_colon = { 0, 0, NULL };
-       kputs(mode, &mode_colon);
-       kputc(':', &mode_colon);
-       fp = s3_open_for_reading(url, mode_colon.s, NULL);
-       free(mode_colon.s);
-    }
+    kstring_t mode_colon = { 0, 0, NULL };
+    kputs(mode, &mode_colon);
+    kputc(':', &mode_colon);
+    fp = s3_open_v4(url, mode_colon.s, NULL);
+    free(mode_colon.s);
     
     return fp;
 }

@@ -1212,14 +1212,13 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
         errno = easy_errno(fp->easy, fp->final_result);
         goto error_remove;
     }
-
-    if (mode == 'r') {
-        double dval;
+    
+    if (fp->headers.redirect) {
         long response;
         
         curl_easy_getinfo(fp->easy, CURLINFO_RESPONSE_CODE, &response);
         
-        if (fp->headers.redirect && response == 301) { // PERMANENT_REDIRECT
+        if (response == 301) { // PERMANENT_REDIRECT
             kstring_t new_url = {0, 0, NULL};
             
             if (fp->headers.redirect(fp->headers.callback_data, &in_header, &new_url)) {
@@ -1235,13 +1234,26 @@ libcurl_open(const char *url, const char *modes, http_headers *headers)
             if (err != 0) { errno = ENOSYS; goto error; }
             free(new_url.s);
             
-            restart_from_position(fp, 0);
+            if (restart_from_position(fp, 0) < 0) {
+                goto error_remove;
+            }
 
             if (fp->finished && fp->final_result != CURLE_OK) {
                 errno = easy_errno(fp->easy, fp->final_result);
                 goto error_remove;
             }
+        } else {
+            // we no longer need to look at the headers
+            err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERFUNCTION, NULL);
+            err |= curl_easy_setopt(fp->easy, CURLOPT_HEADERDATA, NULL);
+            free(in_header.s);
+            
+            if (err != 0) { errno = ENOSYS; goto error; }
         }
+    }
+
+    if (mode == 'r') {
+        double dval;
 
         if (curl_easy_getinfo(fp->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD,
                               &dval) == CURLE_OK && dval >= 0.0)
