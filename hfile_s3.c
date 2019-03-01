@@ -978,7 +978,13 @@ static hFILE *s3_open(const char *url, const char *mode)
     kstring_t mode_colon = { 0, 0, NULL };
     kputs(mode, &mode_colon);
     kputc(':', &mode_colon);
-    fp = s3_open_v4(url, mode_colon.s, NULL);
+    
+    if (getenv("HTS_S3_V2") == NULL) { // TEST - LEAVE FOR NOW
+        fp = s3_open_v4(url, mode_colon.s, NULL);
+    } else {
+        fp = s3_rewrite(url, mode_colon.s, NULL);
+    }
+    
     free(mode_colon.s);
     
     return fp;
@@ -986,11 +992,18 @@ static hFILE *s3_open(const char *url, const char *mode)
 
 static hFILE *s3_vopen(const char *url, const char *mode_colon, va_list args0)
 {
+    hFILE *fp;
     // Need to use va_copy() as we can only take the address of an actual
     // va_list object, not that of a parameter whose type may have decayed.
     va_list args;
     va_copy(args, args0);
-    hFILE *fp = s3_rewrite(url, mode_colon, &args);
+    
+    if (getenv("HTS_S3_V2") == NULL) { // TEST - LEAVE FOR NOW
+        fp = s3_open_v4(url, mode_colon, &args);
+    } else {
+        fp = s3_rewrite(url, mode_colon, &args);
+    }
+    
     va_end(args);
     return fp;
 }
