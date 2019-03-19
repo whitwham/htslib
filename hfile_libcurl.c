@@ -1,6 +1,6 @@
 /*  hfile_libcurl.c -- libcurl backend for low-level file streams.
 
-    Copyright (C) 2015-2017 Genome Research Ltd.
+    Copyright (C) 2015-2017, 2019 Genome Research Ltd.
 
     Author: John Marshall <jm18@sanger.ac.uk>
 
@@ -1270,6 +1270,7 @@ error_remove:
     errno = save;
 
 error:
+    if (fp->headers.redirect) free(in_header.s);
     save = errno;
     if (fp->easy) curl_easy_cleanup(fp->easy);
     if (fp->multi) curl_multi_cleanup(fp->multi);

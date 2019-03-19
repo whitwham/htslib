@@ -1,9 +1,66 @@
 /*
-    hfile_s3_write.c
+    hfile_s3_write.c - Code to handle mulitpart uploading to S3.
     
-    Code to handle mulitpart uploading to S3.
+    Copyright (C) 2019 Genome Research Ltd.
+
+    Author: Andrew Whitwham <aw7@sanger.ac.uk>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE
+
+
+S3 Multipart Upload
+-------------------
+
+There are several steps in the Mulitipart upload.
+
+
+1) Initiate Upload
+------------------
+
+Initiate the upload and get an upload ID.  This ID is used in all other steps.
+
+
+2) Upload Part
+--------------
+
+Upload a part of the data.  5Mb minimum part size (except for the last part).
+Each part is numbered and a succesful upload returns an Etag header value that
+needs to used for the completion step.
+
+Step repeated till all data is uploaded.
+
+
+3) Completion
+-------------
+
+Complete the upload by sending all the part numbers along with their associated
+Etag values.
+
+
+Optional - Abort
+----------------
+
+If something goes wrong this instructs the server to delete all the partial
+uploads and abandon the upload process.
+
     
-    Andrew Whitwham, January 2019
+Andrew Whitwham, January 2019
 */
 
 #include <config.h>
@@ -21,7 +78,7 @@
 #ifdef ENABLE_PLUGINS
 #include "version.h"
 #endif
-#include "htslib/hts.h"  // for hts_version() and hts_verbose
+#include "htslib/hts.h"
 #include "htslib/kstring.h"
 #include "htslib/khash.h"
 
@@ -30,35 +87,12 @@
 #define MINIMUM_S3_WRITE_SIZE 5242880
 #define S3_MOVED_PERMANENTLY 301
 
-typedef int (*s3_auth_callback) (void *auth_data, char *, kstring_t*, char*, kstring_t*, kstring_t*, kstring_t*);
-typedef int (*redirect_callback) (void *auth_data, kstring_t*, kstring_t*);
-
-typedef struct {
-    s3_auth_callback callback;
-    redirect_callback redirect_callback;
-    void *callback_data;
-} s3_authorisation;
-
-typedef struct { // FIXME DON@T KNOW IF NEEDED
-    char *path;
-    char *token;
-    time_t expiry;
-    int failed;
-    pthread_mutex_t lock;
-} auth_token;
-
-// For the authorization header cache (DON'T KNOW IF I NEED IT YET FIXME)
-KHASH_MAP_INIT_STR(auth_map, auth_token *)
 
 static struct {
     kstring_t useragent;
     CURLSH *share;
-    char *auth_path;
-    khash_t(auth_map) *auth_map;
-    pthread_mutex_t auth_lock;
     pthread_mutex_t share_lock;
-} curl = { { 0, 0, NULL }, NULL, NULL, NULL, PTHREAD_MUTEX_INITIALIZER,
-           PTHREAD_MUTEX_INITIALIZER };
+} curl = { { 0, 0, NULL }, NULL, PTHREAD_MUTEX_INITIALIZER };
 
 static void share_lock(CURL *handle, curl_lock_data data,
                        curl_lock_access access, void *userptr) {
@@ -69,15 +103,14 @@ static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
     pthread_mutex_unlock(&curl.share_lock);
 }
 
+typedef int (*s3_auth_callback) (void *auth_data, char *, kstring_t*, char*, kstring_t*, kstring_t*, kstring_t*, kstring_t*);
+typedef int (*redirect_callback) (void *auth_data, kstring_t*, kstring_t*);
 
-static void free_auth(auth_token *tok) {
-    if (!tok) return;
-    if (pthread_mutex_destroy(&tok->lock)) abort();
-    free(tok->path);
-    free(tok->token);
-    free(tok);
-}
-
+typedef struct {
+    s3_auth_callback callback;
+    redirect_callback redirect_callback;
+    void *callback_data;
+} s3_authorisation;
 
 typedef struct {
     hFILE base;
@@ -86,7 +119,6 @@ typedef struct {
     s3_authorisation *au;
     kstring_t buffer;
     kstring_t url;
-    kstring_t token_hdr;
     kstring_t upload_id;
     kstring_t completion_message;
     int part_no;
@@ -96,15 +128,16 @@ typedef struct {
 } hFILE_s3_write;
 
 
-static void kinit(kstring_t *s) {
+static void ksinit(kstring_t *s) {
     s->l = 0;
     s->m = 0;
     s->s = NULL;
 }
 
+
 static void ksfree(kstring_t *s) {
     free(s->s);
-    kinit(s);
+    ksinit(s);
 }
 
 
@@ -141,22 +174,25 @@ static int get_entry(char *in, char *start_tag, char *end_tag, kstring_t *out) {
 }
 
 
-static void cleanup(hFILE_s3_write *fp) {
+static void cleanup_local(hFILE_s3_write *fp) {
     ksfree(&fp->buffer);
     ksfree(&fp->url);
-    ksfree(&fp->token_hdr);
     ksfree(&fp->upload_id);
     ksfree(&fp->completion_message);
-    
-    // free up authorisation data
-    fp->au->callback(fp->au->callback_data,  NULL, NULL, NULL, NULL, NULL, NULL);
-    free(fp->au);
-    
     curl_easy_cleanup(fp->curl);
+    free(fp->au);
+
 }
 
 
-struct curl_slist *set_html_headers(hFILE_s3_write *fp, kstring_t *auth, kstring_t *date, kstring_t *content) {
+static void cleanup(hFILE_s3_write *fp) {
+    // free up authorisation data
+    fp->au->callback(fp->au->callback_data,  NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    cleanup_local(fp);
+}
+
+
+struct curl_slist *set_html_headers(hFILE_s3_write *fp, kstring_t *auth, kstring_t *date, kstring_t *content, kstring_t *token) {
     struct curl_slist *headers = NULL;
     
     headers = curl_slist_append(headers, "Content-Type:"); // get rid of this
@@ -164,6 +200,10 @@ struct curl_slist *set_html_headers(hFILE_s3_write *fp, kstring_t *auth, kstring
     headers = curl_slist_append(headers, auth->s);
     headers = curl_slist_append(headers, date->s);
     headers = curl_slist_append(headers, content->s);
+    
+    if (token->l) {
+        headers = curl_slist_append(headers, token->s);
+    }
 
     curl_easy_setopt(fp->curl, CURLOPT_HTTPHEADER, headers);
     
@@ -181,6 +221,7 @@ static int abort_upload(hFILE_s3_write *fp) {
     kstring_t content = {0, 0, NULL};
     kstring_t canonical_query_string = {0, 0, NULL};
     kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
     char http_request[] = "DELETE";
@@ -190,7 +231,7 @@ static int abort_upload(hFILE_s3_write *fp) {
     }    
 
     ret = fp->au->callback(fp->au->callback_data,  http_request, NULL,
-             canonical_query_string.s, &content_hash, &authorisation, &date);
+             canonical_query_string.s, &content_hash, &authorisation, &date, &token);
              
     if (ret) {
         return -1;
@@ -209,7 +250,7 @@ static int abort_upload(hFILE_s3_write *fp) {
     
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content);
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token);
     fp->ret = curl_easy_perform(fp->curl);
     
     if (fp->ret != CURLE_OK) {
@@ -221,7 +262,8 @@ static int abort_upload(hFILE_s3_write *fp) {
     ksfree(&content_hash);
     ksfree(&url);
     ksfree(&date);    
-    ksfree(&canonical_query_string);    
+    ksfree(&canonical_query_string);
+    ksfree(&token);
     curl_slist_free_all(headers);
     
     fp->aborted = 1;
@@ -238,6 +280,7 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     kstring_t content = {0, 0, NULL};
     kstring_t canonical_query_string = {0, 0, NULL};
     kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
     char http_request[] = "POST";
@@ -250,7 +293,7 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     kputs("</CompleteMultipartUpload>\n", &fp->completion_message);
     
     ret = fp->au->callback(fp->au->callback_data,  http_request, &fp->completion_message,
-             canonical_query_string.s, &content_hash, &authorisation, &date);
+             canonical_query_string.s, &content_hash, &authorisation, &date, &token);
 
     if (ret) {
         return -1;
@@ -273,7 +316,7 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
     
-    headers = set_html_headers(fp, &authorisation, &date, &content);
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token);
     fp->ret = curl_easy_perform(fp->curl);
     
     if (fp->ret != CURLE_OK) {
@@ -284,7 +327,8 @@ static int complete_upload(hFILE_s3_write *fp, kstring_t *resp) {
     ksfree(&content);
     ksfree(&content_hash);
     ksfree(&url);
-    ksfree(&date);    
+    ksfree(&date);
+    ksfree(&token);    
     ksfree(&canonical_query_string);    
     curl_slist_free_all(headers);
     
@@ -317,6 +361,7 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
     kstring_t content = {0, 0, NULL};
     kstring_t canonical_query_string = {0, 0, NULL};
     kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
     char http_request[] = "PUT";
@@ -327,7 +372,7 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
 
     ret = fp->au->callback(
             fp->au->callback_data, http_request, &fp->buffer, canonical_query_string.s,
-            &content_hash, &authorisation, &date);
+            &content_hash, &authorisation, &date, &token);
 
     if (ret) {
         return -1;
@@ -353,7 +398,7 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
     
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);    
     
-    headers = set_html_headers(fp, &authorisation, &date, &content);
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token);
     fp->ret = curl_easy_perform(fp->curl);
     
     if (fp->ret != CURLE_OK) {
@@ -364,7 +409,8 @@ static int upload_part(hFILE_s3_write *fp, kstring_t *resp) {
     ksfree(&content);
     ksfree(&content_hash);
     ksfree(&url);
-    ksfree(&date);    
+    ksfree(&date);
+    ksfree(&token);    
     ksfree(&canonical_query_string);    
     curl_slist_free_all(headers);
     
@@ -506,12 +552,13 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
     kstring_t url = {0, 0, NULL};
     kstring_t content = {0, 0, NULL};
     kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
     int ret = 0;
     struct curl_slist *headers;
     char http_request[] = "POST";
     
     ret = fp->au->callback(fp->au->callback_data,  http_request, NULL,
-             "uploads=", &content_hash, &authorisation, &date);
+             "uploads=", &content_hash, &authorisation, &date, &token);
              
     if (ret) {
         return -1;
@@ -540,7 +587,7 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
     
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
     
-    headers = set_html_headers(fp, &authorisation, &date, &content);
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token);
     fp->ret = curl_easy_perform(fp->curl);
     
     if (fp->ret != CURLE_OK) {
@@ -551,7 +598,8 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
     ksfree(&content);
     ksfree(&content_hash);
     ksfree(&url);
-    ksfree(&date);    
+    ksfree(&date);
+    ksfree(&token);  
     curl_slist_free_all(headers);
     
     return ret;    
@@ -561,7 +609,7 @@ static int initialise_upload(hFILE_s3_write *fp, kstring_t *head, kstring_t *res
 static int get_upload_id(hFILE_s3_write *fp, kstring_t *resp) {
     int ret = 0;
 
-    kinit(&fp->upload_id);
+    ksinit(&fp->upload_id);
 
     if (get_entry(resp->s, "<UploadId>", "</UploadId>", &fp->upload_id) == EOF) {
         ret = -1;
@@ -583,14 +631,12 @@ static hFILE *s3_write_open(const char *url, s3_authorisation *auth) {
     int ret;
     
     if (!auth || !auth->callback || !auth->callback_data) {
-        // FIXME ERROR STUFF
         return NULL;
     }
     
     fp = (hFILE_s3_write *)hfile_init(sizeof(hFILE_s3_write), "w", 0);
     
     if (fp == NULL) {
-        // FIXME ERROR STUFF HERE
         return NULL;
     }
     
@@ -605,9 +651,9 @@ static hFILE *s3_write_open(const char *url, s3_authorisation *auth) {
     
     memcpy(fp->au, auth, sizeof(s3_authorisation));
     
-    kinit(&fp->buffer);
-    kinit(&fp->url);
-    kinit(&fp->token_hdr);
+    ksinit(&fp->buffer);
+    ksinit(&fp->url);
+    ksinit(&fp->completion_message);
     fp->aborted = 0;
     
     if (hts_verbose >= 8) {
@@ -642,7 +688,7 @@ static hFILE *s3_write_open(const char *url, s3_authorisation *auth) {
     if (get_upload_id(fp, &response)) goto error;
     
     // start the completion message (a formatted list of parts)
-    kinit(&fp->completion_message);
+    ksinit(&fp->completion_message);
 
     if (kputs("<CompleteMultipartUpload>\n", &fp->completion_message) == EOF) {
         goto error;
@@ -656,7 +702,9 @@ static hFILE *s3_write_open(const char *url, s3_authorisation *auth) {
     return &fp->base;
     
 error:
-    // do some cleaning up here FIXME
+    ksfree(&response);
+    cleanup_local(fp);
+    hfile_destroy((hFILE *)fp);
     return NULL;
 }
     
@@ -711,23 +759,6 @@ static void s3_write_exit() {
 
     free(curl.useragent.s);
     curl.useragent.l = curl.useragent.m = 0; curl.useragent.s = NULL;
-
-    free(curl.auth_path);
-    curl.auth_path = NULL;
-
-    if (curl.auth_map) {
-        khiter_t i;
-        for (i = kh_begin(curl.auth_map); i != kh_end(curl.auth_map); ++i) {
-            if (kh_exist(curl.auth_map, i)) {
-                free_auth(kh_value(curl.auth_map, i));
-                kh_key(curl.auth_map, i) = NULL;
-                kh_value(curl.auth_map, i) = NULL;
-            }
-        }
-        kh_destroy(auth_map, curl.auth_map);
-        curl.auth_map = NULL;
-    }
-
     curl_global_cleanup();
 }
 

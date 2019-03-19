@@ -1,6 +1,6 @@
 /*  hfile_s3.c -- Amazon S3 backend for low-level file streams.
 
-    Copyright (C) 2015-2017 Genome Research Ltd.
+    Copyright (C) 2015-2017, 2019 Genome Research Ltd.
 
     Author: John Marshall <jm18@sanger.ac.uk>
 
@@ -530,16 +530,16 @@ static void hash_string(char *in, size_t length, char *out) {
     }
 }
 
-static void kinit(kstring_t *s) {
+static void ksinit(kstring_t *s) {
     s->l = 0;
     s->m = 0;
     s->s = NULL;
 }
 
 
-static void kfree(kstring_t *s) {
+static void ksfree(kstring_t *s) {
     free(s->s);
-    kinit(s);
+    ksinit(s);
 }
 
 
@@ -573,7 +573,7 @@ static int make_signature(s3_auth_data *ad, kstring_t *string_to_sign, char *sig
         sprintf(signature_string + j, "%02x", signature[i]);
     }
     
-    kfree(&secret_access_key);
+    ksfree(&secret_access_key);
     
     return 0;
 }
@@ -588,14 +588,25 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
     char cr_hash[HASH_LENGTH_SHA256];
     char signature_string[HASH_LENGTH_SHA256];
     
-    kputs("host;x-amz-content-sha256;x-amz-date", &signed_headers);
+    
+    if (!ad->token.l) {
+        kputs("host;x-amz-content-sha256;x-amz-date", &signed_headers);
+    } else {
+        kputs("host;x-amz-content-sha256;x-amz-date;x-amz-security-token", &signed_headers);
+    }
     
     if (signed_headers.l == 0) {
         return -1;
     }
     
-    ksprintf(&canonical_headers, "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
+    
+    if (!ad->token.l) {
+        ksprintf(&canonical_headers, "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
         ad->host_base.s, content, ad->date_long);
+    } else {
+        ksprintf(&canonical_headers, "host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\nx-amz-security-token:%s\n",
+        ad->host_base.s, content, ad->date_long, ad->token.s);
+    }
         
     if (canonical_headers.l == 0) {
         return -1;
@@ -636,34 +647,26 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
         return -1;
     }
     
-    kfree(&signed_headers);
-    kfree(&canonical_headers);
-    kfree(&canonical_request);
-    kfree(&scope);
-    kfree(&string_to_sign);
+    ksfree(&signed_headers);
+    ksfree(&canonical_headers);
+    ksfree(&canonical_request);
+    ksfree(&scope);
+    ksfree(&string_to_sign);
     
     return 0;
 }
 
 
-static int write_authorisation_callback(void *auth, char *request, kstring_t *content, char *cqs,
-                                        kstring_t *hash, kstring_t *auth_str, kstring_t *date) {
-    s3_auth_data *ad = (s3_auth_data *)auth;
+static int update_time(s3_auth_data *ad) {
+    int ret = -1;
     time_t now = time(NULL);
-    char content_hash[HASH_LENGTH_SHA256];
 #ifdef HAVE_GMTIME_R
     struct tm tm_buffer;
     struct tm *tm = gmtime_r(&now, &tm_buffer);
 #else
     struct tm *tm = gmtime(&now);
-#endif
-
-    if (request == NULL) {
-        // signal to free auth data
-        free_auth_data(ad);
-        return 0;
-    }
-
+#endif  
+  
     if (now - ad->auth_time > AUTH_LIFETIME) {
         // update timestamp
         ad->auth_time = now;
@@ -678,6 +681,27 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
 
         ad->date_html.l = 0;
         ksprintf(&ad->date_html, "x-amz-date: %s", ad->date_long);
+    }
+    
+    if (ad->date_html.l) ret = 0;
+    
+    return ret;
+}
+
+
+static int write_authorisation_callback(void *auth, char *request, kstring_t *content, char *cqs,
+                                        kstring_t *hash, kstring_t *auth_str, kstring_t *date, kstring_t *token) {
+    s3_auth_data *ad = (s3_auth_data *)auth;
+    char content_hash[HASH_LENGTH_SHA256];
+
+    if (request == NULL) {
+        // signal to free auth data
+        free_auth_data(ad);
+        return 0;
+    }
+
+    if (update_time(ad)) {
+        return -1;
     }
     
     if (content) {
@@ -705,10 +729,63 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
         return -1;
     }
     
+    if (ad->token.l) {
+        ksprintf(token, "x-amz-security-token: %s", ad->token.s);
+    }
+    
     return 0;
 }
 
 
+static int v4_auth_header_callback(void *ctx, char ***hdrs) {
+    s3_auth_data *ad = (s3_auth_data *) ctx;
+    char content_hash[HASH_LENGTH_SHA256];
+    kstring_t content = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+  
+    if (!hdrs) { // Closing connection
+        free_auth_data(ad);
+        return 0;
+    }
+    
+    if (update_time(ad)) {
+        return -1;
+    }
+    
+    hash_string("", 0, content_hash); // empty hash
+    
+    ad->canonical_query_string.l = 0;
+    kputs("", &ad->canonical_query_string);
+ 
+    if (make_authorisation(ad, "GET", content_hash, &authorisation)) {
+        return -1;
+    }
+    
+    ksprintf(&content, "x-amz-content-sha256: %s", content_hash);
+    
+    if (content.l == 0) {
+        return -1;
+    }
+    
+    {
+        char **hdr = &ad->headers[0];
+        *hdrs = hdr;
+        *hdr = strdup(authorisation.s);
+        hdr++;
+        *hdr = strdup(ad->date_html.s);
+        hdr++;
+        *hdr = strdup(content.s);
+        hdr++;
+        *hdr = NULL;
+    }
+    
+    ksfree(&content);
+    ksfree(&authorisation);
+    
+    return 0;
+}
+
+     
 static int redirect_endpoint_callback(void *auth, kstring_t *header, kstring_t *url) {
     s3_auth_data *ad = (s3_auth_data *)auth;
     char *new_region;
@@ -746,71 +823,6 @@ static int redirect_endpoint_callback(void *auth, kstring_t *header, kstring_t *
     return ret;
 }
 
-
-static int v4_auth_header_callback(void *ctx, char ***hdrs) {
-    s3_auth_data *ad = (s3_auth_data *) ctx;
-    char content_hash[HASH_LENGTH_SHA256];
-    kstring_t content = {0, 0, NULL};
-    kstring_t authorisation = {0, 0, NULL};
-    time_t now = time(NULL);
-#ifdef HAVE_GMTIME_R
-    struct tm tm_buffer;
-    struct tm *tm = gmtime_r(&now, &tm_buffer);
-#else
-    struct tm *tm = gmtime(&now);
-#endif  
-  
-    if (!hdrs) { // Closing connection
-        free_auth_data(ad);
-        return 0;
-    }
-    
-    if (now - ad->auth_time > AUTH_LIFETIME) {
-        // update timestamp
-        ad->auth_time = now;
-   
-        if (strftime(ad->date_long, 17, "%Y%m%dT%H%M%SZ", tm) != 16) {
-            return -1;
-        }
-
-        if (strftime(ad->date_short, 9, "%Y%m%d", tm) != 8) {
-            return -1;;
-        }
-
-        ad->date_html.l = 0;
-        ksprintf(&ad->date_html, "x-amz-date: %s", ad->date_long);
-    }
-    
-    hash_string("", 0, content_hash); // empty hash
-    
-    if (make_authorisation(ad, "GET", content_hash, &authorisation)) {
-        return -1;
-    }
-    
-    ksprintf(&content, "x-amz-content-sha256: %s", content_hash);
-    
-    if (content.l == 0) {
-        return -1;
-    }
-    
-    {
-        char **hdr = &ad->headers[0];
-        *hdrs = hdr;
-        *hdr = strdup(authorisation.s);
-        hdr++;
-        *hdr = strdup(ad->date_html.s);
-        hdr++;
-        *hdr = strdup(content.s);
-        hdr++;
-        *hdr = NULL;
-    }
-    
-    kfree(&content);
-    kfree(&authorisation);
-    
-    return 0;
-}
-     
 
 static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     kstring_t profile  = {0, 0, NULL};
@@ -927,8 +939,6 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     }
     
     if (read) {
-        kputs("", &ad->canonical_query_string);
-        
         if (ad->token.l > 0) {
             kputs("x-amz-security-token: ", &token_hdr);
             kputs(ad->token.s, &token_hdr);
@@ -940,6 +950,8 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
                           "httphdr_callback", v4_auth_header_callback,
                           "httphdr_callback_data", ad,
                           "redirect_callback", redirect_endpoint_callback, NULL);
+                          
+        if (fp == NULL) goto error;
     } else {
         kstring_t final_url = {0, 0, NULL};
     
@@ -953,6 +965,8 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
                             "s3_auth_callback_data", ad,
                             "redirect_callback", redirect_endpoint_callback, NULL);
         free(final_url.s);
+        
+        if (fp == NULL) goto error;
     }
     
     free(profile.s);
@@ -966,7 +980,8 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     free(profile.s);
     free(url.s);
     free(token_hdr.s);
-
+    free_auth_data(ad);
+    
     return NULL;
 }   
     
@@ -979,7 +994,7 @@ static hFILE *s3_open(const char *url, const char *mode)
     kputs(mode, &mode_colon);
     kputc(':', &mode_colon);
     
-    if (getenv("HTS_S3_V2") == NULL) { // TEST - LEAVE FOR NOW
+    if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
         fp = s3_open_v4(url, mode_colon.s, NULL);
     } else {
         fp = s3_rewrite(url, mode_colon.s, NULL);
@@ -998,7 +1013,7 @@ static hFILE *s3_vopen(const char *url, const char *mode_colon, va_list args0)
     va_list args;
     va_copy(args, args0);
     
-    if (getenv("HTS_S3_V2") == NULL) { // TEST - LEAVE FOR NOW
+    if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
         fp = s3_open_v4(url, mode_colon, &args);
     } else {
         fp = s3_rewrite(url, mode_colon, &args);
