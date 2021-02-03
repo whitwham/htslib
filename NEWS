@@ -4,20 +4,32 @@ Noteworthy changes in release a.b
 Features and Updates
 --------------------
 
-* Added experimental CRAM 3.1 support. (#929)
+* Added experimental CRAM 3.1 and 4.0 support. (#929)
 
-* Added an introspection API for checking some of the capabilities provided
-  by HTSlib. (#1170)
-    - `hts_list_schemes`: returns the number of schemes found
-    - `hts_list_plugins`: returns the number of plugins found
-    - `htslib_has_plugin`: checks if a specific plugin is available
-    - `htslib_features`: returns a bit mask with all available features
-    - `htslib_test_feature`: test if a feature is available
+  These should not be used for long term data storage as the
+  specification still needs to be ratified by GA4GH and may be subject
+  to changes in format. (This is highly likely for 4.0).  However it
+  may be tested using:
 
-* Made performance improvements to `probaln_glocal` method. (#1188)
-    - Caching of reused loop variables and removal of loop invariants
-    - Code reordering to remove instruction latency.
-    - Other refactoring and tidyups.
+    test/test_view -t ref.fa -C -o version=3.1 in.bam -p out31.cram
+
+  For smaller but slower files, try varying the compression profile
+  with an additional "-o small".  Profile choices are fast, normal,
+  small and archive, and can be applied to all CRAM versions.
+
+* Added a general filtering syntax for alignment records in SAM/BAM/CRAM
+  readers. (#1181, #1203)
+
+  An example to find chromosome spanning read-pairs with high mapping
+  quality:  'mqual >= 30 && mrname != rname'
+
+  To find significant sized deletions:
+  'cigar =~ "[0-9]{2}D"' or 'rlen - qlen > 10'.
+
+  To report duplicates that aren't part of a "proper pair":
+  'flag.dup && !flag.proper_pair'
+
+  More details are in the samtools.1 man page under "FILTER EXPRESSIONS".
 
 * The knet networking code has been removed.  It only supported the http
   and ftp protocols, and a better and safer alternative using libcurl
@@ -27,11 +39,22 @@ Features and Updates
 * The old htslib/knetfile.h interfaces have been marked as deprecated.  Any
   code still using them should be updated to use hFILE instead. (#1200)
 
-* Added a general filtering syntax for alignment records in SAM/BAM/CRAM
-  readers. (#1181, #1203)
+* Added an introspection API for checking some of the capabilities provided
+  by HTSlib. (#1170)
+    - `hfile_list_schemes`: returns the number of schemes found
+    - `hfile_list_plugins`: returns the number of plugins found
+    - `hfile_has_plugin`: checks if a specific plugin is available
+    - `hts_features`: returns a bit mask with all available features
+    - `hts_test_feature`: test if a feature is available
 
-* Added a public method for constructing a BAM record from the component pieces.
-  Thanks to Anders Kaplan. (#1159, #1164)
+* Made performance improvements to `probaln_glocal` method, which
+  speeds up mpileup BAQ calculations. (#1188)
+    - Caching of reused loop variables and removal of loop invariants
+    - Code reordering to remove instruction latency.
+    - Other refactoring and tidyups.
+
+* Added a public method for constructing a BAM record from the
+  component pieces. Thanks to Anders Kaplan. (#1159, #1164)
 
 * Added two public methods, `sam_parse_cigar` and `bam_parse_cigar`, as part of
   a small CIGAR API (#1169, #1182). Thanks to Daniel Cameron for input. (#1147)
@@ -42,7 +65,18 @@ Build changes
 
 These are compiler, configuration and makefile based changes.
 
+* The CRAM codecs are now obtained via the htscodecs submodule, hence
+  when cloning it is now best to use "git clone --recursive".  In an
+  existing clone, you may use "git submodule update --init" to obtain
+  the htscodecs submodule checkout.
+
 * Updated CI test configuration to recurse HTSlib submodules. (#1359)
+
+* Added Cirrus-CI integration as a replacement for Travis, which was
+  phased out.  (#1175; #1212)
+
+* Updated the Windows image used by Appveyor to 'Visual Studio 2019'. (#1172;
+  fixed #1166)
 
 * Fixed a buglet in configure.ac, exposed by the release 2.70 of autoconf.
   Thanks to John Marshall. (#1198)
@@ -59,12 +93,6 @@ These are compiler, configuration and makefile based changes.
   intentional fall through case statements, when building with 
   `-Wextra flag`. Thanks to John Marshall. (#1163)
 
-* Added Cirrus-CI integration as a replacement for Travis, which was phased out.
-  (#1175; #1212)
-
-* Updated the Windows image used by Appveyor to 'Visual Studio 2019'. (#1172;
-  fixed #1166)
-
 
 Bug fixes
 ---------
@@ -80,8 +108,8 @@ Bug fixes
   fixed #1186)
 
 * Made `bam_itr_next` an alias for `sam_itr_next`, to prevent it from crashing
-  when working with htsFile pointers. Thanks to Torbjörn Klatt for reporting it.
-  (#1180; fixed #1179)
+  when working with htsFile pointers. Thanks to Torbjörn Klatt for
+  reporting it. (#1180; fixed #1179)
 
 * Fixed once per outgoing multi-threaded block `bgzf_idx_flush` assertion, to
   accommodate situations when a single record could span multiple blocks.
@@ -93,31 +121,12 @@ Bug fixes
 * Fixed the minimum offset of a BAI index bin, to account for unmapped reads.
   Thanks to John Marshall for spotting the issue. (#1158; fixed #1142)
 
-* Fixed the CRLF handling in `sam_parse_worker` method. Thanks to Anders Kaplan.
-  (#1149; fixed #1148)
+* Fixed the CRLF handling in `sam_parse_worker` method. Thanks to
+  Anders Kaplan. (#1149; fixed #1148)
 
-* Included unistd.h and erro.h directly in HTSlib files, as opposed to including
-  them indirectly, via third party code. Thanks to Andrew Patterson (#1143) and
-  John Marshall (#1145).
-
-
-Fuzzer fixes
-------------
-
-* Fixed a small memory leak when decoding malformed slice header. (#1215; 
-  fixed oss-fuzz 30105)
-
-* Fixed a small memory leak when decoding malformed XPACK encoding. (#1216;
-  fixed oss-fuzz 30164)
-
-* Fixed other CRAM related OSS-Fuzz discovered issues. (#1208; fixed
-  oss-fuzz 29827, oss-fuzz 29837, oss-fuzz 29855, oss-fuzz 29908,
-  oss-fuzz 29858; #1214; fixed oss-fuzz 30012, oss-fuzz 30014)
-
-* Fixed CRAM 3.1 related issues discovered by the Google OSS-Fuzz. (#1206)
-
-* Fixed a memory leak on bad input in `vcf_parse_info` method. (#1178; fixed
-  oss-fuzz 26968).
+* Included unistd.h and erro.h directly in HTSlib files, as opposed to
+  including them indirectly, via third party code. Thanks to Andrew
+  Patterson (#1143) and John Marshall (#1145).
 
 
 Noteworthy changes in release 1.11 (22nd September 2020)
