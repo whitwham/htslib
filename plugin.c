@@ -42,6 +42,9 @@ DEALINGS IN THE SOFTWARE.  */
 static DIR *open_nextdir(struct hts_path_itr *itr)
 {
     DIR *dir;
+    
+    if (0)
+        fprintf(stderr, "Welcome back!\n");
 
     while (1) {
         const char *colon = strchr(itr->pathdir, HTS_PATH_SEPARATOR_CHAR);
