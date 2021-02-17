@@ -40,12 +40,13 @@ Features and Updates
   code still using them should be updated to use hFILE instead. (#1200)
 
 * Added an introspection API for checking some of the capabilities provided
-  by HTSlib. (#1170)
+  by HTSlib. (#1170) Thanks also to John Marshall for contributions. (#1222)
     - `hfile_list_schemes`: returns the number of schemes found
     - `hfile_list_plugins`: returns the number of plugins found
     - `hfile_has_plugin`: checks if a specific plugin is available
     - `hts_features`: returns a bit mask with all available features
     - `hts_test_feature`: test if a feature is available
+    - `hts_feature_string`: return a string summary of enabled features
 
 * Made performance improvements to `probaln_glocal` method, which
   speeds up mpileup BAQ calculations. (#1188)
@@ -64,6 +65,9 @@ Build changes
 -------------
 
 These are compiler, configuration and makefile based changes.
+
+* Added new Makefile targets for the applications that embed HTSlib
+  and want to run its test suite or clean its generated artefacts. (#1230)
 
 * The CRAM codecs are now obtained via the htscodecs submodule, hence
   when cloning it is now best to use "git clone --recursive".  In an
