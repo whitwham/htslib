@@ -66,8 +66,8 @@ Build changes
 
 These are compiler, configuration and makefile based changes.
 
-* Added new Makefile targets for the applications that embed HTSlib
-  and want to run its test suite or clean its generated artefacts. (#1230)
+* Added new Makefile targets for the applications that embed HTSlib and
+  want to run its test suite or clean its generated artefacts. (#1230, #1238)
 
 * The CRAM codecs are now obtained via the htscodecs submodule, hence
   when cloning it is now best to use "git clone --recursive".  In an
@@ -100,6 +100,10 @@ These are compiler, configuration and makefile based changes.
 
 Bug fixes
 ---------
+
+* Fixed VCF `#CHROM` header parsing to only separate columns at tab characters.
+  Thanks to Sam Morris for reporting the issue.
+  (#1237; fixed samtools/bcftools#1408)
 
 * Fixed a crash reported in `bcf_sr_sort_set`, which expects REF to be present.
   (#1204; fixed samtools/bcftools#1361)
