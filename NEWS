@@ -133,8 +133,8 @@ Bug fixes
   Anders Kaplan. (#1149; fixed #1148)
 
 * Included unistd.h and erro.h directly in HTSlib files, as opposed to
-  including them indirectly, via third party code. Thanks to Andrew
-  Patterson (#1143) and John Marshall (#1145).
+  including them indirectly, via third party code. Thanks to
+  Andrew Patterson (#1143) and John Marshall (#1145).
 
 
 Noteworthy changes in release 1.11 (22nd September 2020)
