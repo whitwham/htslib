@@ -60,6 +60,11 @@ Features and Updates
 * Added two public methods, `sam_parse_cigar` and `bam_parse_cigar`, as part of
   a small CIGAR API (#1169, #1182). Thanks to Daniel Cameron for input. (#1147)
 
+* HTSlib, and the included htsfile program, will now recognise the old
+  RAZF compressed file format.  Note that while the format is detected,
+  HTSlib is unable to read it.  It is recommended that RAZF files are
+  uncompressed with `gunzip` before using them with HTSlib.  Thanks to
+  John Marshall. (#1244)
 
 Build changes
 -------------
