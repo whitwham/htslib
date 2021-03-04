@@ -64,7 +64,8 @@ Features and Updates
   RAZF compressed file format.  Note that while the format is detected,
   HTSlib is unable to read it.  It is recommended that RAZF files are
   uncompressed with `gunzip` before using them with HTSlib.  Thanks to
-  John Marshall. (#1244)
+  John Marshall (#1244); and Matthew J. Oldach who reported problems
+  with uncompressing some RAZF files (samtools/samtools#1387).
 
 Build changes
 -------------
@@ -102,6 +103,8 @@ These are compiler, configuration and makefile based changes.
   intentional fall through case statements, when building with 
   `-Wextra flag`. Thanks to John Marshall. (#1163)
 
+* Non-configure builds now define _XOPEN_SOURCE=600 to allow them to work
+  when the `gcc -std=c99` option is used.  Thanks to John Marshall. (#1246)
 
 Bug fixes
 ---------
