@@ -67,6 +67,11 @@ Features and Updates
   John Marshall (#1244); and Matthew J. Oldach who reported problems
   with uncompressing some RAZF files (samtools/samtools#1387).
 
+* The S3 plugin now has options to force the address style.  It will recognise
+  the addressing_style and host_bucket entries in the respective aws
+  .credentials and s3cmd .s3cfg files.  There is also a new HTS_S3_ADDRESS_STYLE
+  environment variable.  Details are in the htslib-s3-plugin.7 man file (#1249).
+
 Build changes
 -------------
 
