@@ -33,6 +33,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include <time.h>
 
 #include <errno.h>
+#include <pthread.h
 
 #include "hfile_internal.h"
 #ifdef ENABLE_PLUGINS
@@ -41,6 +42,8 @@ DEALINGS IN THE SOFTWARE.  */
 #include "htslib/hts.h"  // for hts_version() and hts_verbose
 #include "htslib/kstring.h"
 #include "hts_time_funcs.h"
+
+#include <curl/curl.h>
 
 typedef struct s3_auth_data {
     kstring_t id;
@@ -1113,19 +1116,22 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
     }
 
     ad->canonical_query_string.l = 0;
-    kputs(cqs, &ad->canonical_query_string);
 
-    if (ad->canonical_query_string.l == 0) {
-        return -1;
-    }
+    if (cqs) {
+        kputs(cqs, &ad->canonical_query_string);
 
-    /* add a user provided query string, normally only useful on upload initiation */
-    if (uqs) {
-        kputs("&", &ad->canonical_query_string);
-        kputs(ad->user_query_string.s, &ad->canonical_query_string);
+//        if (ad->canonical_query_string.l == 0) {
+//            return -1;
+//        }
 
-        if (order_query_string(&ad->canonical_query_string)) {
-            return -1;
+        /* add a user provided query string, normally only useful on upload initiation */
+        if (uqs) {
+            kputs("&", &ad->canonical_query_string);
+            kputs(ad->user_query_string.s, &ad->canonical_query_string);
+
+            if (order_query_string(&ad->canonical_query_string)) {
+                return -1;
+            }
         }
     }
 
@@ -1147,119 +1153,6 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
     return 0;
 }
 
-
-static int v4_auth_header_callback(void *ctx, char ***hdrs) {
-    s3_auth_data *ad = (s3_auth_data *) ctx;
-    char content_hash[HASH_LENGTH_SHA256];
-    kstring_t content = KS_INITIALIZE;
-    kstring_t authorisation = KS_INITIALIZE;
-    kstring_t token_hdr = KS_INITIALIZE;
-    char *date_html = NULL;
-    time_t now;
-    int idx;
-
-    if (!hdrs) { // Closing connection
-        free_auth_data(ad);
-        return 0;
-    }
-
-    now = time(NULL);
-
-    if (update_time(ad, now)) {
-        return -1;
-    }
-
-    if (ad->creds_expiry_time > 0
-        && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
-        refresh_auth_data(ad);
-    }
-
-    if (!ad->id.l || !ad->secret.l) {
-        return copy_auth_headers(ad, hdrs);
-    }
-
-    hash_string("", 0, content_hash, sizeof(content_hash)); // empty hash
-
-    ad->canonical_query_string.l = 0;
-
-    if (ad->user_query_string.l > 0) {
-        kputs(ad->user_query_string.s, &ad->canonical_query_string);
-
-        if (order_query_string(&ad->canonical_query_string)) {
-            return -1;
-        }
-    } else {
-        kputs("", &ad->canonical_query_string);
-    }
-
-    if (make_authorisation(ad, "GET", content_hash, &authorisation)) {
-        return -1;
-    }
-
-    ksprintf(&content, "x-amz-content-sha256: %s", content_hash);
-    date_html = strdup(ad->date_html.s);
-
-    if (ad->token.l > 0) {
-        kputs("X-Amz-Security-Token: ", &token_hdr);
-        kputs(ad->token.s, &token_hdr);
-    }
-
-    if (content.l == 0 || date_html == NULL) {
-        ksfree(&authorisation);
-        ksfree(&content);
-        ksfree(&token_hdr);
-        free(date_html);
-        return -1;
-    }
-
-    *hdrs = &ad->headers[0];
-    idx = 0;
-    ad->headers[idx++] = ks_release(&authorisation);
-    ad->headers[idx++] = date_html;
-    ad->headers[idx++] = ks_release(&content);
-    if (token_hdr.s)
-        ad->headers[idx++] = ks_release(&token_hdr);
-    ad->headers[idx++] = NULL;
-
-    return 0;
-}
-
-static int handle_400_response(hFILE *fp, s3_auth_data *ad) {
-    // v4 signatures in virtual hosted mode return 400 Bad Request if the
-    // wrong region is used to make the signature.  The response is an xml
-    // document which includes the name of the correct region.  This can
-    // be extracted and used to generate a corrected signature.
-    // As the xml is fairly simple, go with something "good enough" instead
-    // of trying to parse it properly.
-
-    char buffer[1024], *region, *reg_end;
-    ssize_t bytes;
-
-    bytes = hread(fp, buffer, sizeof(buffer) - 1);
-    if (bytes < 0) {
-        return -1;
-    }
-    buffer[bytes] = '\0';
-    region = strstr(buffer, "<Region>");
-    if (region == NULL) {
-        return -1;
-    }
-    region += 8;
-    while (isspace((unsigned char) *region)) ++region;
-    reg_end = strchr(region, '<');
-    if (reg_end == NULL || strncmp(reg_end + 1, "/Region>", 8) != 0) {
-        return -1;
-    }
-    while (reg_end > region && isspace((unsigned char) reg_end[-1])) --reg_end;
-    ad->region.l = 0;
-    kputsn(region, reg_end - region, &ad->region);
-    if (ad->region.l == 0) {
-        return -1;
-    }
-
-    return 0;
-}
-
 static int set_region(void *adv, kstring_t *region) {
     s3_auth_data *ad = (s3_auth_data *) adv;
 
@@ -1267,28 +1160,1215 @@ static int set_region(void *adv, kstring_t *region) {
     return kputsn(region->s, region->l, &ad->region) < 0;
 }
 
-static int http_status_errno(int status)
-{
-    if (status >= 500)
-        switch (status) {
-        case 501: return ENOSYS;
-        case 503: return EBUSY;
-        case 504: return ETIMEDOUT;
-        default:  return EIO;
-        }
-    else if (status >= 400)
-        switch (status) {
-        case 401: return EPERM;
-        case 403: return EACCES;
-        case 404: return ENOENT;
-        case 405: return EROFS;
-        case 407: return EPERM;
-        case 408: return ETIMEDOUT;
-        case 410: return ENOENT;
-        default:  return EINVAL;
-        }
-    else return 0;
+//
+// Writing and reading handling
+//
+//
+//
+
+// Some common code
+
+static struct {
+    kstring_t useragent;
+    CURLSH *share;
+    pthread_mutex_t share_lock;
+} curl = { { 0, 0, NULL }, NULL, PTHREAD_MUTEX_INITIALIZER };
+
+static void share_lock(CURL *handle, curl_lock_data data,
+                       curl_lock_access access, void *userptr) {
+    pthread_mutex_lock(&curl.share_lock);
 }
+
+static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
+    pthread_mutex_unlock(&curl.share_lock);
+}
+
+typedef struct {
+    hFILE base;
+    CURL *curl;
+    CURLcode ret;
+    s3_auth_data *au;
+    kstring_t buffer;
+    kstring_t url;
+    long verbose;
+    int write;
+    int part_size; // size for reading or writing
+
+    // write variables
+    kstring_t upload_id;
+    kstring_t completion_message;
+    int part_no;
+    int aborted;
+    size_t index;
+    int expand;
+
+    // read variables
+    size_t last_read;               // last read position (remote)
+    size_t last_read_buffer;        // last read (local buffer)
+    size_t file_size;               // size of the file being read
+    int keep_going;
+
+} hFILE_s3; // prob can just call it hFILE_s3 when done
+
+static size_t response_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    kstring_t *resp = (kstring_t *)userp;
+
+    if (kputsn((const char *)contents, realsize, resp) == EOF) {
+        return 0;
+    }
+
+    return realsize;
+}
+
+
+static struct curl_slist *set_html_headers(hFILE_s3 *fp, kstring_t *auth, kstring_t *date,
+                 kstring_t *content, kstring_t *token, kstring_t *range) {
+    struct curl_slist *headers = NULL;
+
+    headers = curl_slist_append(headers, auth->s);
+    headers = curl_slist_append(headers, date->s);
+    headers = curl_slist_append(headers, content->s);
+
+    if (range) {
+        headers = curl_slist_append(headers, range->s);
+    }
+
+    if (token->l) {
+        headers = curl_slist_append(headers, token->s);
+    }
+
+    curl_easy_setopt(fp->curl, CURLOPT_HTTPHEADER, headers);
+
+    return headers;
+}
+
+
+/*
+
+S3 Multipart Upload
+-------------------
+
+There are several steps in the Mulitipart upload.
+
+
+1) Initiate Upload
+------------------
+
+Initiate the upload and get an upload ID.  This ID is used in all other steps.
+
+
+2) Upload Part
+--------------
+
+Upload a part of the data.  5Mb minimum part size (except for the last part).
+Each part is numbered and a successful upload returns an Etag header value that
+needs to used for the completion step.
+
+Step repeated till all data is uploaded.
+
+
+3) Completion
+-------------
+
+Complete the upload by sending all the part numbers along with their associated
+Etag values.
+
+
+Optional - Abort
+----------------
+
+If something goes wrong this instructs the server to delete all the partial
+uploads and abandon the upload process.
+*/
+
+/*
+   This is the writing code.
+*/
+
+#define MINIMUM_S3_WRITE_SIZE 5242880
+#define S3_MOVED_PERMANENTLY 301
+#define S3_BAD_REQUEST 400
+#define S3_NOT_FOUND 404
+
+// Lets the part memory size grow to about 1Gb giving a 2.5Tb max file size.
+// Max. parts allowed by AWS is 10000, so use ceil(10000.0/9.0)
+#define EXPAND_ON 1112
+
+/* As the response text is case insensitive we need a version of strstr that
+   is also case insensitive.  The response is small so no need to get too
+   complicated on the string search.
+*/
+static char *stristr(char *haystack, char *needle) {
+
+    while (*haystack) {
+        char *h = haystack;
+        char *n = needle;
+
+        while (toupper(*h) == toupper(*n)) {
+            h++, n++;
+            if (!h || !n) break;
+        }
+
+        if (!*n) break;
+
+        haystack++;
+    }
+
+    if (!*haystack) return NULL;
+
+    return haystack;
+}
+
+
+static int get_entry(char *in, char *start_tag, char *end_tag, kstring_t *out) {
+    char *start;
+    char *end;
+
+    if (!in) {
+        return EOF;
+    }
+
+    start = stristr(in, start_tag);
+    if (!start) return EOF;
+
+    start += strlen(start_tag);
+    end = stristr(start, end_tag);
+
+    if (!end) return EOF;
+
+    return kputsn(start, end - start, out);
+}
+
+
+static void initialise_local(hFILE_s3 *fp) {
+    ks_initialize(&fp->buffer);
+    ks_initialize(&fp->url);
+    ks_initialize(&fp->upload_id);           // write only
+    ks_initialize(&fp->completion_message);  // write only
+}
+
+
+static void cleanup_local(hFILE_s3 *fp) {
+    ks_free(&fp->buffer);
+    ks_free(&fp->url);
+    ks_free(&fp->upload_id);
+    ks_free(&fp->completion_message);
+    curl_easy_cleanup(fp->curl);
+    free(fp->au);
+
+}
+
+
+static void cleanup(hFILE_s3 *fp) {
+    // free up authorisation data
+    fwrite_authorisation_callback((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    cleanup_local(fp);
+}
+
+
+/*
+    The partially uploaded file will hang around unless the delete command is sent.
+*/
+static int abort_upload(hFILE_s3 *fp) {
+    kstring_t content_hash = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+    kstring_t url = {0, 0, NULL};
+    kstring_t content = {0, 0, NULL};
+    kstring_t canonical_query_string = {0, 0, NULL};
+    kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
+    int ret = -1;
+    struct curl_slist *headers = NULL;
+    char http_request[] = "DELETE";
+
+    if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
+        goto out;
+    }
+
+    if (write_authorisation_callback((void *)fp->au,  http_request, NULL,
+                         canonical_query_string.s, &content_hash,
+                         &authorisation, &date, &token, 0) != 0) {
+        goto out;
+    }
+
+    if (ksprintf(&url, "%s?%s", fp->url.s, canonical_query_string.s) < 0) {
+        goto out;
+    }
+
+    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+        goto out;
+    }
+
+    curl_easy_reset(fp->curl);
+    curl_easy_setopt(fp->curl, CURLOPT_CUSTOMREQUEST, http_request);
+    curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, curl.useragent.s);
+    curl_easy_setopt(fp->curl, CURLOPT_URL, url.s);
+
+    curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
+
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    fp->ret = curl_easy_perform(fp->curl);
+
+    if (fp->ret == CURLE_OK) {
+        ret = 0;
+    }
+
+ out:
+    ks_free(&authorisation);
+    ks_free(&content);
+    ks_free(&content_hash);
+    ks_free(&url);
+    ks_free(&date);
+    ks_free(&canonical_query_string);
+    ks_free(&token);
+    curl_slist_free_all(headers);
+
+    fp->aborted = 1;
+    cleanup(fp);
+
+    return ret;
+}
+
+
+static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
+    kstring_t content_hash = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+    kstring_t url = {0, 0, NULL};
+    kstring_t content = {0, 0, NULL};
+    kstring_t canonical_query_string = {0, 0, NULL};
+    kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
+    int ret = -1;
+    struct curl_slist *headers = NULL;
+    char http_request[] = "POST";
+
+    if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
+        return -1;
+    }
+
+    // finish off the completion reply
+    if (kputs("</CompleteMultipartUpload>\n", &fp->completion_message) < 0) {
+        goto out;
+    }
+
+    if (write_authorisation_callback((void *)fp->au,  http_request,
+                         &fp->completion_message, canonical_query_string.s,
+                         &content_hash, &authorisation, &date, &token, 0) != 0) {
+        goto out;
+    }
+
+    if (ksprintf(&url, "%s?%s", fp->url.s, canonical_query_string.s) < 0) {
+        goto out;
+    }
+
+    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+        goto out;
+    }
+
+    curl_easy_reset(fp->curl);
+    curl_easy_setopt(fp->curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(fp->curl, CURLOPT_POSTFIELDS, fp->completion_message.s);
+    curl_easy_setopt(fp->curl, CURLOPT_POSTFIELDSIZE, (long) fp->completion_message.l);
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEFUNCTION, response_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEDATA, (void *)resp);
+    curl_easy_setopt(fp->curl, CURLOPT_URL, url.s);
+    curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, curl.useragent.s);
+
+    curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
+
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    fp->ret = curl_easy_perform(fp->curl);
+
+    if (fp->ret == CURLE_OK) {
+        ret = 0;
+    }
+
+ out:
+    ks_free(&authorisation);
+    ks_free(&content);
+    ks_free(&content_hash);
+    ks_free(&url);
+    ks_free(&date);
+    ks_free(&token);
+    ks_free(&canonical_query_string);
+    curl_slist_free_all(headers);
+
+    return ret;
+}
+
+
+static size_t upload_callback(void *ptr, size_t size, size_t nmemb, void *stream) {
+    size_t realsize = size * nmemb;
+    hFILE_s3 *fp = (hFILE_s3 *)stream;
+    size_t read_length;
+
+    if (realsize > (fp->buffer.l - fp->index)) {
+        read_length = fp->buffer.l - fp->index;
+    } else {
+        read_length = realsize;
+    }
+
+    memcpy(ptr, fp->buffer.s + fp->index, read_length);
+    fp->index += read_length;
+
+    return read_length;
+}
+
+
+static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
+    kstring_t content_hash = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+    kstring_t url = {0, 0, NULL};
+    kstring_t content = {0, 0, NULL};
+    kstring_t canonical_query_string = {0, 0, NULL};
+    kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
+    int ret = -1;
+    struct curl_slist *headers = NULL;
+    char http_request[] = "PUT";
+
+    if (ksprintf(&canonical_query_string, "partNumber=%d&uploadId=%s", fp->part_no, fp->upload_id.s) < 0) {
+        return -1;
+    }
+
+    if (write_authorisation_callback((void)fp->au, http_request, &fp->buffer,
+                         canonical_query_string.s, &content_hash,
+                         &authorisation, &date, &token, 0) != 0) {
+        goto out;
+    }
+
+    if (ksprintf(&url, "%s?%s", fp->url.s, canonical_query_string.s) < 0) {
+        goto out;
+    }
+
+    fp->index = 0;
+    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+        goto out;
+    }
+
+    curl_easy_reset(fp->curl);
+
+    curl_easy_setopt(fp->curl, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(fp->curl, CURLOPT_READFUNCTION, upload_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_READDATA, fp);
+    curl_easy_setopt(fp->curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)fp->buffer.l);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERFUNCTION, response_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERDATA, (void *)resp);
+    curl_easy_setopt(fp->curl, CURLOPT_URL, url.s);
+    curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, curl.useragent.s);
+
+    curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
+
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    fp->ret = curl_easy_perform(fp->curl);
+
+    if (fp->ret == CURLE_OK) {
+        ret = 0;
+    }
+
+ out:
+    ks_free(&authorisation);
+    ks_free(&content);
+    ks_free(&content_hash);
+    ks_free(&url);
+    ks_free(&date);
+    ks_free(&token);
+    ks_free(&canonical_query_string);
+    curl_slist_free_all(headers);
+
+    return ret;
+}
+
+
+static ssize_t s3_write(hFILE *fpv, const void *bufferv, size_t nbytes) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    const char *buffer  = (const char *)bufferv;
+
+    if (kputsn(buffer, nbytes, &fp->buffer) == EOF) {
+        return -1;
+    }
+
+    if (fp->buffer.l > fp->part_size) {
+        // time to write out our data
+        kstring_t response = {0, 0, NULL};
+        int ret;
+
+        ret = upload_part(fp, &response);
+
+        if (!ret) {
+            long response_code;
+            kstring_t etag = {0, 0, NULL};
+
+            curl_easy_getinfo(fp->curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+            if (response_code > 200) {
+                ret = -1;
+            } else {
+                if (get_entry(response.s, "Etag: \"", "\"", &etag) == EOF) {
+                    fprintf(stderr, "Failed to read Etag\n");
+                    ret = -1;
+                } else {
+                    ksprintf(&fp->completion_message, "\t<Part>\n\t\t<PartNumber>%d</PartNumber>\n\t\t<ETag>%s</ETag>\n\t</Part>\n",
+                        fp->part_no, etag.s);
+
+                    ks_free(&etag);
+                }
+            }
+        }
+
+        ks_free(&response);
+
+        if (ret) {
+            abort_upload(fp);
+            return -1;
+        }
+
+        fp->part_no++;
+        fp->buffer.l = 0;
+
+        if (fp->expand && (fp->part_no % EXPAND_ON == 0)) {
+            fp->part_size *= 2;
+        }
+    }
+
+    return nbytes;
+}
+
+
+static int s3_write_close(hFILE *fpv) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    kstring_t response = {0, 0, NULL};
+    int ret = 0;
+
+    if (!fp->aborted) {
+
+        if (fp->buffer.l) {
+            // write the last part
+
+            ret = upload_part(fp, &response);
+
+            if (!ret) {
+                long response_code;
+                kstring_t etag = {0, 0, NULL};
+
+                curl_easy_getinfo(fp->curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+                if (response_code > 200) {
+                    ret = -1;
+                } else {
+                    if (get_entry(response.s, "ETag: \"", "\"", &etag) == EOF) {
+                        ret = -1;
+                    } else {
+                        ksprintf(&fp->completion_message, "\t<Part>\n\t\t<PartNumber>%d</PartNumber>\n\t\t<ETag>%s</ETag>\n\t</Part>\n",
+                            fp->part_no, etag.s);
+
+                        ks_free(&etag);
+                    }
+                }
+            }
+
+            ks_free(&response);
+
+            if (ret) {
+                abort_upload(fp);
+                return -1;
+            }
+
+            fp->part_no++;
+        }
+
+        if (fp->part_no > 1) {
+            ret = complete_upload(fp, &response);
+
+            if (!ret) {
+                if (strstr(response.s, "CompleteMultipartUploadResult") == NULL) {
+                    ret = -1;
+                }
+            }
+        } else {
+            ret = -1;
+        }
+
+        if (ret) {
+            abort_upload(fp);
+        } else {
+            cleanup(fp);
+        }
+    }
+
+    ks_free(&response);
+
+    return ret;
+}
+
+
+static int redirect_endpoint(hFILE_s3 *fp, kstring_t *head) {
+    int ret = -1;
+
+    ret = redirect_endpoint_callback((void *)fp->au, 301, head, &fp->url);
+
+    return ret;
+}
+
+static int handle_bad_request(hFILE_s3 *fp, kstring_t *resp) {
+    kstring_t region = {0, 0, NULL};
+    int ret = -1;
+
+    if (get_entry(resp->s, "<Region>", "</Region>", &region) == EOF) {
+        return -1;
+    }
+
+    ret = set_region((void *)fp->au, &region);
+
+    ks_free(&region);
+
+    return ret;
+}
+
+static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int user_query) {
+    kstring_t content_hash = {0, 0, NULL};
+    kstring_t authorisation = {0, 0, NULL};
+    kstring_t url = {0, 0, NULL};
+    kstring_t content = {0, 0, NULL};
+    kstring_t date = {0, 0, NULL};
+    kstring_t token = {0, 0, NULL};
+    int ret = -1;
+    struct curl_slist *headers = NULL;
+    char http_request[] = "POST";
+    char delimiter = '?';
+
+    if (user_query) {
+        delimiter = '&';
+    }
+
+    if (write_authorisation_callback((void)fp->au,  http_request, NULL, "uploads=",
+                         &content_hash, &authorisation, &date, &token, user_query) != 0) {
+        goto out;
+    }
+
+    if (ksprintf(&url, "%s%cuploads", fp->url.s, delimiter) < 0) {
+        goto out;
+    }
+
+    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+        goto out;
+    }
+
+    curl_easy_setopt(fp->curl, CURLOPT_URL, url.s);
+    curl_easy_setopt(fp->curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(fp->curl, CURLOPT_POSTFIELDS, "");  // send no data
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEFUNCTION, response_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEDATA, (void *)resp);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERFUNCTION, response_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERDATA, (void *)head);
+    curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, curl.useragent.s);
+
+    curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
+
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    fp->ret = curl_easy_perform(fp->curl);
+
+    if (fp->ret == CURLE_OK) {
+        ret = 0;
+    }
+
+ out:
+    ks_free(&authorisation);
+    ks_free(&content);
+    ks_free(&content_hash);
+    ks_free(&url);
+    ks_free(&date);
+    ks_free(&token);
+    curl_slist_free_all(headers);
+
+    return ret;
+}
+
+
+static int get_upload_id(hFILE_s3 *fp, kstring_t *resp) {
+    int ret = 0;
+
+    if (get_entry(resp->s, "<UploadId>", "</UploadId>", &fp->upload_id) == EOF) {
+        ret = -1;
+    }
+
+    return ret;
+}
+
+
+/*
+    Now for the reading code
+*/
+// Todo - need to keep track of (and control) its own buffer for reading
+//        with the idea being to read in "chunks" and reduce the overall
+//        cost involved in using AWS.
+
+#define READ_PART_SIZE 1048576
+
+static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv) {
+    hFILE_s3 *fp = (hFILE_s3 *) fpv;
+    size_t n = size * nmemb;
+
+    // fprintf(stderr, "recv n %ld\n", n);
+
+    if (n) {
+        if (kputsn(ptr, n, &fp->buffer) == EOF) {
+            return 0; // FIX ME - error message
+        }
+    }
+
+    return n;
+}
+
+
+static int s3_read_close(hFILE *fpv) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    int ret = 0;
+
+    // FIX ME - do tidying up here
+    cleanup(fp);
+    return ret;
+}
+
+
+static int get_part(hFILE_s3 *fp, kstring_t *resp) {
+    kstring_t content_hash = KS_INITIALIZE;
+    kstring_t authorisation = KS_INITIALIZE;
+    kstring_t content = KS_INITIALIZE;
+    kstring_t date = KS_INITIALIZE;
+    kstring_t token = KS_INITIALIZE;
+    kstring_t range = KS_INITIALIZE;
+    struct curl_slist *headers = NULL;
+    int ret = -1;
+    char http_request[] = "GET";
+    char canonical_query_string = 0;
+
+    if (hts_verbose > 5) fprintf(stderr, "get_part\n");
+
+    ks_clear(&fp->buffer); // reset storage buffer
+
+
+    // FIXME - unnecessary void cast
+    if (write_authorisation_callback((void *)fp->au, http_request, NULL,
+                         &canonical_query_string, &content_hash,
+                         &authorisation, &date, &token, 0) != 0) {
+        goto out;
+    }
+
+    if (hts_verbose > 5) fprintf(stderr, "get_part auth done\n");
+
+    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+        goto out;
+    }
+
+    if (hts_verbose > 5) fprintf(stderr, "get_part content set\n");
+
+    if (ksprintf(&range, "Range: bytes=%zu-%zu", fp->last_read, fp->last_read + fp->part_size - 1) < 0) {
+        goto out;
+    }
+
+    if (hts_verbose > 5) fprintf(stderr, "get_part range set %s\n", range.s);
+
+    curl_easy_reset(fp->curl);
+
+    curl_easy_setopt(fp->curl, CURLOPT_URL, fp->url.s);
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEFUNCTION, recv_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_WRITEDATA, (void *)fp);
+    curl_easy_setopt(fp->curl, CURLOPT_USERAGENT, curl.useragent.s);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERFUNCTION, response_callback);
+    curl_easy_setopt(fp->curl, CURLOPT_HEADERDATA, (void *)resp);
+
+    curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
+
+    headers = set_html_headers(fp, &authorisation, &date, &content, &token, &range);
+    fp->ret = curl_easy_perform(fp->curl);
+
+    if (fp->ret == CURLE_OK) {
+        ret = 0;
+    }
+
+    if (hts_verbose > 5) fprintf(stderr, "get_part ret %d\n", ret);
+
+ out:
+    ks_free(&authorisation);
+    ks_free(&content);
+    ks_free(&content_hash);
+    ks_free(&date);
+    ks_free(&range);
+    ks_free(&token);
+    curl_slist_free_all(headers);
+
+    return ret;
+}
+
+
+static ssize_t s3_read(hFILE *fpv, void *bufferv, size_t nbytes) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    char *buffer = (char *)bufferv;
+    size_t read = 0;
+    static size_t total = 0;
+    static size_t gets  = 0;
+
+    /* Transfer data from the fp->buffer to the calling buffer.
+       If there is no data left in the fp->buffer, grab another chunk of
+       data from s3.
+    */
+
+    if (hts_verbose > 5) fprintf(stderr, "s3_read keep_going %d read %zu nbytes %zu\n", fp->keep_going, read, nbytes);
+    
+    while (fp->keep_going && read < nbytes) {
+        if (hts_verbose > 5) fprintf(stderr, "read  %zu nbytes %zu\n", read, nbytes);
+
+        if (hts_verbose > 5) fprintf(stderr, "buffer.l %zu last_read %zu\n", fp->buffer.l, fp->last_read_buffer);
+
+        if (fp->buffer.l && fp->last_read_buffer < fp->buffer.l) {
+            // copy data across
+            size_t to_copy;
+            size_t remaining = fp->buffer.l - fp->last_read_buffer;
+            size_t bytes_left = nbytes - read;
+
+            if (hts_verbose >  5) fprintf(stderr, "remaining %zu read %zu bytes_left %zu, nbytes %zu\n", remaining, read, bytes_left, nbytes);
+
+            if (bytes_left < remaining) {
+                to_copy = bytes_left;
+            } else {
+                to_copy = remaining;
+            }
+
+            memcpy(buffer + read, fp->buffer.s + fp->last_read_buffer, to_copy);
+            read += to_copy;
+            fp->last_read_buffer += to_copy;
+
+            if ((fp->buffer.l < fp->part_size) && (fp->last_read_buffer == fp->buffer.l)) {
+                fp->keep_going = 0;
+            }
+        } else {
+            int ret;
+            kstring_t response = {0, 0, NULL};
+
+            ret = get_part(fp, &response);
+
+            if (hts_verbose > 5) fprintf(stderr, "read error %d\n", ret); // FIX ME - do something with the return
+
+            if (fp->buffer.l == 0) {
+                fprintf(stderr, "Returned no data.\n");
+                fp->keep_going = 0;
+                break;
+            }
+
+            fp->last_read_buffer = 0;
+            fp->last_read = fp->last_read + fp->buffer.l;
+            gets++;
+
+            // deal with the response
+            ks_free(&response);
+        }
+    }
+
+    total += read;
+    if (hts_verbose > 5) fprintf(stderr, "s3_read end read  %zu nbytes %zu total %zu gets %zu\n", read, nbytes, total, gets);
+
+    return read;
+}
+
+
+static off_t s3_seek(hFILE *fpv, off_t offset, int whence) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    off_t origin;
+    
+    fprintf(stderr, "seeking offset %ld whence %d\n", offset, whence);
+
+    if (fp->write) {
+        // lets not try and seek while writing
+        errno = ESPIPE;
+        return -1;
+    }
+    
+    fprintf(stderr, "seeking pre choice\n");
+    // I am not sure we handle any seek other than one from the beginning
+    switch (whence) {
+        case SEEK_SET:
+            origin = 0;
+            break;
+        case SEEK_CUR:
+            // we might be able to work this out
+            errno = ENOSYS;
+            return -1;
+        case SEEK_END:
+            if (fp->file_size < 0) {
+                errno = ESPIPE;
+                return -1;
+            }
+            
+            origin = fp->file_size;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    
+    fprintf(stderr, "seeking here\n");
+    // Check 0 <= origin+offset < fp->file_size carefully, avoiding overflow
+    if ((offset < 0)? origin + offset < 0
+                : (fp->file_size >= 0 && offset > fp->file_size - origin)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    fp->keep_going = 1;
+    fp->last_read = origin + offset; // origin is really only useful if we can make the other modes work
+    ks_clear(&fp->buffer); // resetting fp->buffer triggers a new remote read
+    fprintf(stderr, "Cleared buffer length %ld\n", fp->buffer.l);
+
+    return fp->last_read;
+}
+
+/*
+    Unlike upload, download does not really need an initialisation.  Here we use it to
+    get the size of the wanted files and as a test for redirects.
+*/
+static int initialise_download(hFILE_s3 *fp, kstring_t *resp) {
+
+    fp->last_read = 0;
+    ks_clear(resp);
+
+    return get_part(fp, resp);
+}
+
+
+static int s3_close(hFILE *fpv) {
+    hFILE_s3 *fp = (hFILE_s3 *)fpv;
+    int ret;
+
+    if (!fp->write) {
+        ret = s3_read_close(fpv);
+    } else {
+        ret = s3_write_close(fpv);
+    }
+
+    return ret;
+}
+
+
+static const struct hFILE_backend s3_backend = {
+    s3_read, s3_write, s3_seek, NULL, s3_close
+};
+
+// Read and write opens here _ amalgamate?
+
+static hFILE *s3_write_open(const char *url, s3_auth_data *auth) {
+    hFILE_s3 *fp;
+    kstring_t response = {0, 0, NULL};
+    kstring_t header   = {0, 0, NULL};
+    int ret, has_user_query = 0;
+    char *query_start;
+    const char *env;
+
+
+    fp = (hFILE_s3 *)hfile_init(sizeof(hFILE_s3), "w", 0);
+
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    if ((fp->curl = curl_easy_init()) == NULL) {
+        errno = ENOMEM;
+        goto error;
+    }
+
+    fp->au = auth;
+
+    initialise_local(fp);
+    fp->aborted = 0;
+    fp->part_size = MINIMUM_S3_WRITE_SIZE;
+    fp->expand = 1;
+    fp->write = 1;
+
+    if ((env = getenv("HTS_S3_PART_SIZE")) != NULL) {
+        int part_size = atoi(env) * 1024 * 1024;
+
+        if (part_size > fp->part_size)
+            fp->part_size = part_size;
+
+        fp->expand = 0;
+    }
+
+    if (hts_verbose >= 8) {
+        fp->verbose = 1L;
+    } else {
+        fp->verbose = 0L;
+    }
+
+    kputs(url + 5, &fp->url);
+
+    if ((query_start = strchr(fp->url.s, '?'))) {
+        has_user_query = 1;;
+    }
+
+    ret = initialise_upload(fp, &header, &response, has_user_query);
+
+    if (ret == 0) {
+        long response_code;
+
+        curl_easy_getinfo(fp->curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+        if (response_code == S3_MOVED_PERMANENTLY) {
+            if (redirect_endpoint(fp, &header) == 0) {
+                ks_free(&response);
+                ks_free(&header);
+
+                ret = initialise_upload(fp, &header, &response, has_user_query);
+            }
+        } else if (response_code == S3_BAD_REQUEST) {
+            if (handle_bad_request(fp, &response) == 0) {
+                ks_free(&response);
+                ks_free(&header);
+
+                ret = initialise_upload(fp, &header, &response, has_user_query);
+            }
+        }
+
+        ks_free(&header); // no longer needed
+    }
+
+    if (ret) goto error;
+
+    if (get_upload_id(fp, &response)) goto error;
+
+    // start the completion message (a formatted list of parts)
+    if (kputs("<CompleteMultipartUpload>\n", &fp->completion_message) == EOF) {
+        goto error;
+    }
+
+    fp->part_no = 1;
+
+    // user query string no longer a useful part of the URL
+    if (query_start)
+         *query_start = '\0';
+
+    fp->base.backend = &s3_backend;
+    ks_free(&response);
+
+    return &fp->base;
+
+error:
+    ks_free(&response);
+    cleanup_local(fp);
+    hfile_destroy((hFILE *)fp);
+    return NULL;
+}
+
+
+static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
+    hFILE_s3 *fp;
+    const char *env;
+    kstring_t response   = {0, 0, NULL};
+    kstring_t file_range = {0, 0, NULL};
+    int ret;
+
+    fp = (hFILE_s3 *)hfile_init(sizeof(hFILE_s3), "r", 0);
+
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    if ((fp->curl = curl_easy_init()) == NULL) {
+        errno = ENOMEM;
+        goto error;
+    }
+
+    fp->au = auth;
+
+    initialise_local(fp);
+    fp->last_read = 0; // ranges start at 0
+    fp->write = 0;
+
+    if ((env = getenv("HTS_S3_READ_PART_SIZE")) != NULL) {
+        fp->part_size = atoi(env) * 1024 * 1024;
+    } else {
+        fp->part_size = READ_PART_SIZE;
+    }
+
+    if (hts_verbose >= 8) {
+        fp->verbose = 1L;
+    } else {
+        fp->verbose = 0L;
+    }
+
+    kputs(url + 3, &fp->url);
+
+    ret = initialise_download(fp, &response);
+
+    if (ret == 0) {
+        long response_code;
+
+        curl_easy_getinfo(fp->curl, CURLINFO_RESPONSE_CODE, &response_code);
+
+        if (response_code == S3_MOVED_PERMANENTLY) {
+            if (redirect_endpoint(fp, &response) == 0) {
+                ret = initialise_download(fp, &response);
+            }
+        } else if (response_code == S3_BAD_REQUEST) {
+            fprintf(stderr, "BAD REQUEST!!!\n");
+
+            if (hts_verbose > 5) fprintf(stderr, "%s\n", fp->buffer.s);
+
+            if (handle_bad_request(fp, &fp->buffer) == 0) {
+                ret = initialise_download(fp, &response);
+            }
+        } else if (response_code == S3_NOT_FOUND) {
+            fprintf(stderr, "File not found.\n");
+            ret = -1;
+        }
+    }
+
+
+    if (ret) {
+        fprintf(stderr, "Unable to open file.\n");
+        goto error;
+    }
+
+    if (get_entry(response.s, "content-range: bytes ", "\n", &file_range) == EOF) {
+        fprintf(stderr, "Warning: Failed to read file size.\n");
+        fp->file_size = -1;
+    } else {
+        char *s;
+        if ((s = strchr(file_range.s, '/'))) {
+            fprintf(stderr, "\nfile_range %s\n", file_range.s);
+            fp->file_size = strtoll(s + 1, NULL, 10);
+            fprintf(stderr, "Final size %zu\n", fp->file_size);
+        } else {
+            fp->file_size = -1;
+        }
+    }
+
+    fp->last_read_buffer = 0;
+    fp->last_read = fp->last_read + fp->buffer.l;
+    fp->base.backend = &s3_backend;
+    fp->keep_going = 1;
+
+    // FIXME: there may be other settings, put them here
+
+    ks_free(&response);
+    ks_free(&file_range);
+    return &fp->base;
+
+
+ error:
+    ks_free(&response);
+    ks_free(&file_range);
+    cleanup_local(fp);
+    hfile_destroy((hFILE *)fp);
+    return NULL;
+}
+
+//
+//
+//
+//
+//
+//
+
+// static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
+//     kstring_t url = { 0, 0, NULL };
+// 
+//     s3_auth_data *ad = setup_auth_data(s3url, mode, 4, &url);
+//     hFILE *fp = NULL;
+// 
+//     if (ad == NULL) {
+//         return NULL;
+//     }
+// 
+//     kstring_t final_url = KS_INITIALIZE;
+// 
+//      // add the scheme marker
+//     ksprintf(&final_url, "s3rw+%s", url.s);
+// 
+//     if(final_url.l == 0) goto error;
+// 
+//     fp = hopen(final_url.s, mode, "va_list", argsp,
+//                "s3_auth_callback",  write_authorisation_callback,
+//                "s3_auth_callback_data", ad,
+//                "redirect_callback", redirect_endpoint_callback,
+//                "set_region_callback", set_region,
+//                NULL);
+//     free(final_url.s);
+// 
+//     if (fp == NULL) goto error;
+// 
+//     free(url.s);
+// 
+//     return fp;
+// 
+//   error:
+// 
+//     if (fp) hclose_abruptly(fp);
+//     free(url.s);
+//     free_auth_data(ad);
+// 
+//     return NULL;
+// }
+// 
+// 
+// static hFILE *s3_open(const char *url, const char *mode)
+// {
+//     hFILE *fp;
+// 
+//     fprintf(stderr, "s3_open\n");
+// 
+//     kstring_t mode_colon = { 0, 0, NULL };
+//     kputs(mode, &mode_colon);
+//     kputc(':', &mode_colon);
+// 
+//     if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
+//         fp = s3_open_v4(url, mode_colon.s, NULL);
+//     } else {
+//         fp = s3_rewrite(url, mode_colon.s, NULL);
+//     }
+// 
+//     free(mode_colon.s);
+// 
+//     return fp;
+// }
+// 
+// static hFILE *s3_vopen(const char *url, const char *mode_colon, va_list args0)
+// {
+//     hFILE *fp;
+//     // Need to use va_copy() as we can only take the address of an actual
+//     // va_list object, not that of a parameter whose type may have decayed.
+//     va_list args;
+//     va_copy(args, args0);
+// 
+//     fprintf(stderr, "s3_vopen\n");
+//     printf("HELLO WORLD!");
+// 
+//     if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
+//         fp = s3_open_v4(url, mode_colon, &args);
+//     } else {
+//         fp = s3_rewrite(url, mode_colon, &args);
+//     }
+// 
+//     va_end(args);
+//     return fp;
+// }
+// 
+// 
+// static hFILE *vhopen_s3(const char *url, const char *mode, va_list args) {
+//     hFILE *fp = NULL;
+//     s3_authorisation auth = {NULL, NULL, NULL};
+// 
+//     if (parse_va_list(&auth, args) == 0) {
+//         if (*mode == 'r') {
+//             fp  = s3_read_open(url, &auth);
+//         } else {
+//             fp =  s3_write_open(url, &auth);
+//         }
+//     }
+// 
+//     return fp;
+// }
+
 
 static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     kstring_t url = { 0, 0, NULL };
@@ -1299,144 +2379,118 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     if (ad == NULL) {
         return NULL;
     }
-
-    if (ad->mode == 'r') {
-        long http_response = 0;
-
-        fp = hopen(url.s, mode, "va_list", argsp,
-                   "httphdr_callback", v4_auth_header_callback,
-                   "httphdr_callback_data", ad,
-                   "redirect_callback", redirect_endpoint_callback,
-                   "redirect_callback_data", ad,
-                   "http_response_ptr", &http_response,
-                   "fail_on_error", 0,
-                   NULL);
-
-        if (fp == NULL) goto error;
-
-        if (http_response == 307) {
-            // Follow additional redirect.
-            ad->refcount = 1;
-            hclose_abruptly(fp);
-
-            url.l  = 0;
-            ksprintf(&url, "https://%s%s", ad->host.s, ad->bucket);
-
-            fp = hopen(url.s, mode, "va_list", argsp,
-                   "httphdr_callback", v4_auth_header_callback,
-                   "httphdr_callback_data", ad,
-                   "redirect_callback", redirect_endpoint_callback,
-                   "redirect_callback_data", ad,
-                   "http_response_ptr", &http_response,
-                   "fail_on_error", 0,
-                   NULL);
-        }
-
-        if (http_response == 400) {
-            ad->refcount = 1;
-            if (handle_400_response(fp, ad) != 0) {
-                goto error;
-            }
-            hclose_abruptly(fp);
-            fp = hopen(url.s, mode, "va_list", argsp,
-                       "httphdr_callback", v4_auth_header_callback,
-                       "httphdr_callback_data", ad,
-                       "redirect_callback", redirect_endpoint_callback,
-                       "redirect_callback_data", ad,
-                       NULL);
-        } else if (http_response > 400) {
-            ad->refcount = 1;
-            errno = http_status_errno(http_response);
-            goto error;
-        }
-
-        if (fp == NULL) goto error;
+    
+    if (*mode == 'r') {
+        fp  = s3_read_open(url, &auth);
     } else {
-        kstring_t final_url = KS_INITIALIZE;
-
-         // add the scheme marker
-        ksprintf(&final_url, "s3w+%s", url.s);
-
-        if(final_url.l == 0) goto error;
-
-        fp = hopen(final_url.s, mode, "va_list", argsp,
-                   "s3_auth_callback",  write_authorisation_callback,
-                   "s3_auth_callback_data", ad,
-                   "redirect_callback", redirect_endpoint_callback,
-                   "set_region_callback", set_region,
-                   NULL);
-        free(final_url.s);
-
-        if (fp == NULL) goto error;
+        fp =  s3_write_open(url, &auth);
     }
-
-    free(url.s);
-
+    
     return fp;
-
-  error:
-
-    if (fp) hclose_abruptly(fp);
-    free(url.s);
-    free_auth_data(ad);
-
-    return NULL;
 }
 
-
-static hFILE *s3_open(const char *url, const char *mode)
+   
+static hFILE *hopen_s3(const char *url, const char *mode)
 {
     hFILE *fp;
 
-    kstring_t mode_colon = { 0, 0, NULL };
-    kputs(mode, &mode_colon);
-    kputc(':', &mode_colon);
+    fprintf(stderr, "hopen_s3\n");
 
     if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
-        fp = s3_open_v4(url, mode_colon.s, NULL);
+        fp = s3_open_v4(url, mode, NULL);
     } else {
-        fp = s3_rewrite(url, mode_colon.s, NULL);
+        fp = s3_open_v2(url, mode, NULL);
     }
-
-    free(mode_colon.s);
 
     return fp;
 }
 
-static hFILE *s3_vopen(const char *url, const char *mode_colon, va_list args0)
+
+static hFILE *vhopen_s3(const char *url, const char *mode_colon, va_list args0)
 {
     hFILE *fp;
-    // Need to use va_copy() as we can only take the address of an actual
-    // va_list object, not that of a parameter whose type may have decayed.
-    va_list args;
-    va_copy(args, args0);
+    
+    // This should handle to vargs case.  Not sure what vargs we want
+    // to handle
 
-    if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
-        fp = s3_open_v4(url, mode_colon, &args);
-    } else {
-        fp = s3_rewrite(url, mode_colon, &args);
-    }
+    fprintf(stderr, "vhopen\n");
+    
+    fp = hopen_s3(url, mode);
 
-    va_end(args);
     return fp;
 }
 
-int PLUGIN_GLOBAL(hfile_plugin_init,_s3)(struct hFILE_plugin *self)
-{
+
+static void s3_exit(void) {
+    if (curl_share_cleanup(curl.share) == CURLSHE_OK)
+        curl.share = NULL;
+
+    free(curl.useragent.s);
+    curl.useragent.l = curl.useragent.m = 0; curl.useragent.s = NULL;
+    curl_global_cleanup();
+}
+
+
+int PLUGIN_GLOBAL(hfile_plugin_init,_s3)(struct hFILE_plugin *self) {
+
     static const struct hFILE_scheme_handler handler =
-        { s3_open, hfile_always_remote, "Amazon S3", 2000 + 50, s3_vopen
+        { hopen_s3, hfile_always_remote, "Amazon S3",
+          2000 + 50, vhopen_s3
         };
 
 #ifdef ENABLE_PLUGINS
     // Embed version string for examination via strings(1) or what(1)
-    static const char id[] = "@(#)hfile_s3 plugin (htslib)\t" HTS_VERSION_TEXT;
+    static const char id[] =
+        "@(#)hfile_s3 test plugin (htslib)\t" HTS_VERSION_TEXT;
+    const char *version = strchr(id, '\t') + 1;
+
     if (hts_verbose >= 9)
-        fprintf(stderr, "[M::hfile_s3.init] version %s\n", strchr(id, '\t')+1);
+        fprintf(stderr, "[M::hfile_s3.init] version %s\n",
+                version);
+#else
+    const char *version = hts_version();
 #endif
 
+    const curl_version_info_data *info;
+    CURLcode err;
+    CURLSHcode errsh;
+
+    err = curl_global_init(CURL_GLOBAL_ALL);
+
+    if (err != CURLE_OK) {
+        // look at putting in an errno here
+        return -1;
+    }
+
+    curl.share = curl_share_init();
+
+    if (curl.share == NULL) {
+        curl_global_cleanup();
+        errno = EIO;
+        return -1;
+    }
+
+    errsh  = curl_share_setopt(curl.share, CURLSHOPT_LOCKFUNC, share_lock);
+    errsh |= curl_share_setopt(curl.share, CURLSHOPT_UNLOCKFUNC, share_unlock);
+    errsh |= curl_share_setopt(curl.share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+
+    if (errsh != 0) {
+        curl_share_cleanup(curl.share);
+        curl_global_cleanup();
+        errno = EIO;
+        return -1;
+    }
+
+    info = curl_version_info(CURLVERSION_NOW);
+    ksprintf(&curl.useragent, "htslib/%s libcurl/%s", version, info->version);
+
     self->name = "Amazon S3";
-    hfile_add_scheme_handler("s3", &handler);
-    hfile_add_scheme_handler("s3+http", &handler);
+    self->destroy = s3_exit;
+
+    hfile_add_scheme_handler("s3",       &handler);
+    hfile_add_scheme_handler("s3+http",  &handler);
     hfile_add_scheme_handler("s3+https", &handler);
+
     return 0;
 }
+
