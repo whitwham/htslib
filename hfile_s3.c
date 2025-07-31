@@ -33,7 +33,7 @@ DEALINGS IN THE SOFTWARE.  */
 #include <time.h>
 
 #include <errno.h>
-#include <pthread.h
+#include <pthread.h>
 
 #include "hfile_internal.h"
 #ifdef ENABLE_PLUGINS
@@ -394,6 +394,7 @@ static void refresh_auth_data(s3_auth_data *ad) {
     ks_free(&expiry_time);
 }
 
+/* 
 static int auth_header_callback(void *ctx, char ***hdrs) {
     s3_auth_data *ad = (s3_auth_data *) ctx;
 
@@ -451,7 +452,7 @@ static int auth_header_callback(void *ctx, char ***hdrs) {
     free(message.s);
     return -1;
 }
-
+ */
 
 /* like a escape path but for query strings '=' and '&' are untouched */
 static char *escape_query(const char *qs) {
@@ -826,7 +827,7 @@ static s3_auth_data * setup_auth_data(const char *s3url, const char *mode,
     return NULL;
 }
 
-static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
+/*static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
 {
     kstring_t url = { 0, 0, NULL };
     s3_auth_data *ad = setup_auth_data(s3url, mode, 2, &url);
@@ -850,7 +851,7 @@ static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
     free_auth_data(ad);
     return NULL;
 }
-
+ */
 /***************************************************************
 
 AWS S3 sig version 4 writing code
@@ -1355,14 +1356,12 @@ static void cleanup_local(hFILE_s3 *fp) {
     ks_free(&fp->upload_id);
     ks_free(&fp->completion_message);
     curl_easy_cleanup(fp->curl);
-    free(fp->au);
-
 }
 
 
 static void cleanup(hFILE_s3 *fp) {
     // free up authorisation data
-    fwrite_authorisation_callback((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    write_authorisation_callback((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
     cleanup_local(fp);
 }
 
@@ -1532,7 +1531,7 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
         return -1;
     }
 
-    if (write_authorisation_callback((void)fp->au, http_request, &fp->buffer,
+    if (write_authorisation_callback((void *)fp->au, http_request, &fp->buffer,
                          canonical_query_string.s, &content_hash,
                          &authorisation, &date, &token, 0) != 0) {
         goto out;
@@ -1742,7 +1741,7 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
         delimiter = '&';
     }
 
-    if (write_authorisation_callback((void)fp->au,  http_request, NULL, "uploads=",
+    if (write_authorisation_callback((void *)fp->au,  http_request, NULL, "uploads=",
                          &content_hash, &authorisation, &date, &token, user_query) != 0) {
         goto out;
     }
@@ -1869,6 +1868,8 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
     }
 
     if (hts_verbose > 5) fprintf(stderr, "get_part range set %s\n", range.s);
+    
+    if (hts_verbose > 5) fprintf(stderr, "get_part url %s\n", fp->url.s);
 
     curl_easy_reset(fp->curl);
 
@@ -2100,7 +2101,7 @@ static hFILE *s3_write_open(const char *url, s3_auth_data *auth) {
         fp->verbose = 0L;
     }
 
-    kputs(url + 5, &fp->url);
+    kputs(url, &fp->url);
 
     if ((query_start = strchr(fp->url.s, '?'))) {
         has_user_query = 1;;
@@ -2196,7 +2197,7 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
         fp->verbose = 0L;
     }
 
-    kputs(url + 3, &fp->url);
+    kputs(url, &fp->url);
 
     ret = initialise_download(fp, &response);
 
@@ -2380,16 +2381,26 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
         return NULL;
     }
     
+    if (hts_verbose > 5) fprintf(stderr, "s3_open_v4 url %s\n", url.s);
+    
     if (*mode == 'r') {
-        fp  = s3_read_open(url, &auth);
+        fp  = s3_read_open(url.s, ad);
     } else {
-        fp =  s3_write_open(url, &auth);
+        fp =  s3_write_open(url.s, ad);
     }
+    
+    ks_free(&url);
     
     return fp;
 }
 
-   
+static hFILE *s3_open_v2(const char *s3url, const char *mode, va_list *argsp) { 
+    fprintf(stderr, "Auth V2 NOT DONE YET\n");
+    
+    return NULL;
+}
+
+  
 static hFILE *hopen_s3(const char *url, const char *mode)
 {
     hFILE *fp;
@@ -2406,7 +2417,7 @@ static hFILE *hopen_s3(const char *url, const char *mode)
 }
 
 
-static hFILE *vhopen_s3(const char *url, const char *mode_colon, va_list args0)
+static hFILE *vhopen_s3(const char *url, const char *mode, va_list args0)
 {
     hFILE *fp;
     
