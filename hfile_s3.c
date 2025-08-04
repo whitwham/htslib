@@ -869,18 +869,6 @@ static void hash_string(char *in, size_t length, char *out, size_t out_len) {
     }
 }
 
-static void ksinit(kstring_t *s) {
-    s->l = 0;
-    s->m = 0;
-    s->s = NULL;
-}
-
-
-static void ksfree(kstring_t *s) {
-    free(s->s);
-    ksinit(s);
-}
-
 
 static int make_signature(s3_auth_data *ad, kstring_t *string_to_sign, char *signature_string, size_t sig_string_len) {
     unsigned char date_key[SHA256_DIGEST_BUFSIZE];
@@ -912,7 +900,7 @@ static int make_signature(s3_auth_data *ad, kstring_t *string_to_sign, char *sig
         snprintf(signature_string + j, sig_string_len - j, "%02x", signature[i]);
     }
 
-    ksfree(&secret_access_key);
+    ks_free(&secret_access_key);
 
     return 0;
 }
@@ -927,7 +915,10 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
     char cr_hash[HASH_LENGTH_SHA256];
     char signature_string[HASH_LENGTH_SHA256];
     int ret = -1;
-
+    
+    if (!ad->id.l || !ad->secret.l) {
+        return 0;
+    }
 
     if (!ad->token.l) {
         kputs("host;x-amz-content-sha256;x-amz-date", &signed_headers);
@@ -989,11 +980,11 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
     ret = 0;
 
  cleanup:
-    ksfree(&signed_headers);
-    ksfree(&canonical_headers);
-    ksfree(&canonical_request);
-    ksfree(&scope);
-    ksfree(&string_to_sign);
+    ks_free(&signed_headers);
+    ks_free(&canonical_headers);
+    ks_free(&canonical_request);
+    ks_free(&scope);
+    ks_free(&string_to_sign);
 
     return ret;
 }
@@ -1086,7 +1077,7 @@ static int order_query_string(kstring_t *qs) {
 }
 
 
-static int write_authorisation_callback(void *auth, char *request, kstring_t *content, char *cqs,
+static int v4_authorisation(void *auth, char *request, kstring_t *content, char *cqs,
                                         kstring_t *hash, kstring_t *auth_str, kstring_t *date,
                                         kstring_t *token, int uqs) {
     s3_auth_data *ad = (s3_auth_data *)auth;
@@ -1108,7 +1099,7 @@ static int write_authorisation_callback(void *auth, char *request, kstring_t *co
         && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
         refresh_auth_data(ad);
     }
-
+    
     if (content) {
         hash_string(content->s, content->l, content_hash, sizeof(content_hash));
     } else {
@@ -1227,7 +1218,9 @@ static struct curl_slist *set_html_headers(hFILE_s3 *fp, kstring_t *auth, kstrin
                  kstring_t *content, kstring_t *token, kstring_t *range) {
     struct curl_slist *headers = NULL;
 
-    headers = curl_slist_append(headers, auth->s);
+    if (auth->l) 
+        headers = curl_slist_append(headers, auth->s);
+        
     headers = curl_slist_append(headers, date->s);
     headers = curl_slist_append(headers, content->s);
 
@@ -1361,7 +1354,7 @@ static void cleanup_local(hFILE_s3 *fp) {
 
 static void cleanup(hFILE_s3 *fp) {
     // free up authorisation data
-    write_authorisation_callback((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    v4_authorisation((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
     cleanup_local(fp);
 }
 
@@ -1385,7 +1378,7 @@ static int abort_upload(hFILE_s3 *fp) {
         goto out;
     }
 
-    if (write_authorisation_callback((void *)fp->au,  http_request, NULL,
+    if (v4_authorisation((void *)fp->au,  http_request, NULL,
                          canonical_query_string.s, &content_hash,
                          &authorisation, &date, &token, 0) != 0) {
         goto out;
@@ -1451,7 +1444,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
         goto out;
     }
 
-    if (write_authorisation_callback((void *)fp->au,  http_request,
+    if (v4_authorisation((void *)fp->au,  http_request,
                          &fp->completion_message, canonical_query_string.s,
                          &content_hash, &authorisation, &date, &token, 0) != 0) {
         goto out;
@@ -1531,7 +1524,7 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
         return -1;
     }
 
-    if (write_authorisation_callback((void *)fp->au, http_request, &fp->buffer,
+    if (v4_authorisation((void *)fp->au, http_request, &fp->buffer,
                          canonical_query_string.s, &content_hash,
                          &authorisation, &date, &token, 0) != 0) {
         goto out;
@@ -1741,7 +1734,7 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
         delimiter = '&';
     }
 
-    if (write_authorisation_callback((void *)fp->au,  http_request, NULL, "uploads=",
+    if (v4_authorisation((void *)fp->au,  http_request, NULL, "uploads=",
                          &content_hash, &authorisation, &date, &token, user_query) != 0) {
         goto out;
     }
@@ -1849,7 +1842,7 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
 
 
     // FIXME - unnecessary void cast
-    if (write_authorisation_callback((void *)fp->au, http_request, NULL,
+    if (v4_authorisation((void *)fp->au, http_request, NULL,
                          &canonical_query_string, &content_hash,
                          &authorisation, &date, &token, 0) != 0) {
         goto out;
