@@ -827,6 +827,39 @@ static s3_auth_data * setup_auth_data(const char *s3url, const char *mode,
     return NULL;
 }
 
+
+static int v2_authorisation(hFILE_s3 *fp, char *request) {
+    s3_auth_data *ad = fp->au;
+    time_t now = time(NULL);
+
+#ifdef HAVE_GMTIME_R
+    struct tm tm_buffer;
+    struct tm *tm = gmtime_r(&now, &tm_buffer);
+#else
+    struct tm *tm = gmtime(&now);
+#endif
+        
+    if (request == NULL) { // FIXME - probably does not need to be like this anymore
+        // signal to free auth data
+        free_auth_data(ad);
+        return 0;
+    }
+       
+    if (ad->creds_expiry_time > 0
+        && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
+        refresh_auth_data(ad);
+    }
+    
+    // date format between v2 and v4 is different.
+    
+    strftime(ad->date, sizeof(ad->date), "Date: %a, %d %b %Y %H:%M:%S GMT", tm);
+
+
+ 
+
+
+}
+
 /*static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
 {
     kstring_t url = { 0, 0, NULL };
@@ -1077,10 +1110,43 @@ static int order_query_string(kstring_t *qs) {
 }
 
 
-static int v4_authorisation(void *auth, char *request, kstring_t *content, char *cqs,
-                                        kstring_t *hash, kstring_t *auth_str, kstring_t *date,
-                                        kstring_t *token, int uqs) {
-    s3_auth_data *ad = (s3_auth_data *)auth;
+typedef struct {
+    hFILE base;
+    CURL *curl;
+    CURLcode ret;
+    s3_auth_data *au;
+    kstring_t buffer;
+    kstring_t url;
+    long verbose;
+    int write;
+    int part_size; // size for reading or writing
+    
+    kstring_t content_hash;
+    kstring_t authorisation;
+    kstring_t content;
+    kstring_t date;
+    kstring_t token;
+    kstring_t range;
+    
+    // write variables
+    kstring_t upload_id;
+    kstring_t completion_message;
+    int part_no;
+    int aborted;
+    size_t index;
+    int expand;
+
+    // read variables
+    size_t last_read;               // last read position (remote)
+    size_t last_read_buffer;        // last read (local buffer)
+    size_t file_size;               // size of the file being read
+    int keep_going;
+
+} hFILE_s3;
+
+
+static int v4_authorisation(hFILE_s3 *fp, char *request, char *cqs, int uqs) {
+    s3_auth_data *ad = fp->au;
     char content_hash[HASH_LENGTH_SHA256];
     time_t now;
 
@@ -1095,13 +1161,14 @@ static int v4_authorisation(void *auth, char *request, kstring_t *content, char 
     if (update_time(ad, now)) {
         return -1;
     }
+    
     if (ad->creds_expiry_time > 0
         && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
         refresh_auth_data(ad);
     }
     
-    if (content) {
-        hash_string(content->s, content->l, content_hash, sizeof(content_hash));
+    if (fp->content.l) {
+        hash_string(fp->content.s, fp->content.l, content_hash, sizeof(content_hash));
     } else {
         // empty hash
         hash_string("", 0, content_hash, sizeof(content_hash));
@@ -1112,9 +1179,9 @@ static int v4_authorisation(void *auth, char *request, kstring_t *content, char 
     if (cqs) {
         kputs(cqs, &ad->canonical_query_string);
 
-//        if (ad->canonical_query_string.l == 0) {
-//            return -1;
-//        }
+        //if (ad->canonical_query_string.l == 0) {
+        //    return -1;
+        //}
 
         /* add a user provided query string, normally only useful on upload initiation */
         if (uqs) {
@@ -1127,19 +1194,19 @@ static int v4_authorisation(void *auth, char *request, kstring_t *content, char 
         }
     }
 
-    if (make_authorisation(ad, request, content_hash, auth_str)) {
+    if (make_authorisation(ad, request, content_hash, &fp->authorisation)) {
         return -1;
     }
 
-    kputs(ad->date_html.s, date);
-    kputsn(content_hash, HASH_LENGTH_SHA256, hash);
+    kputs(ad->date_html.s, &fp->date);
+    kputsn(content_hash, HASH_LENGTH_SHA256, &fp->content_hash);
 
-    if (date->l == 0 || hash->l == 0) {
+    if (fp->date.l == 0 || &fp->content_hash.l == 0) {
         return -1;
     }
 
     if (ad->token.l) {
-        ksprintf(token, "x-amz-security-token: %s", ad->token.s);
+        ksprintf(&fp->token, "x-amz-security-token: %s", ad->token.s);
     }
 
     return 0;
@@ -1175,32 +1242,36 @@ static void share_unlock(CURL *handle, curl_lock_data data, void *userptr) {
     pthread_mutex_unlock(&curl.share_lock);
 }
 
-typedef struct {
-    hFILE base;
-    CURL *curl;
-    CURLcode ret;
-    s3_auth_data *au;
-    kstring_t buffer;
-    kstring_t url;
-    long verbose;
-    int write;
-    int part_size; // size for reading or writing
 
-    // write variables
-    kstring_t upload_id;
-    kstring_t completion_message;
-    int part_no;
-    int aborted;
-    size_t index;
-    int expand;
+static void initialise_authorisation_values(hFILE_s3 *fp) {
+    ks_initialize(&fp->content_hash);
+    ks_initialize(&fp->authorisation);
+    ks_initialize(&fp->content);
+    ks_initialize(&fp->date);
+    ks_initialize(&fp->token);
+    ks_initialize(&fp->range);
+}
 
-    // read variables
-    size_t last_read;               // last read position (remote)
-    size_t last_read_buffer;        // last read (local buffer)
-    size_t file_size;               // size of the file being read
-    int keep_going;
 
-} hFILE_s3; // prob can just call it hFILE_s3 when done
+static void clear_authorisation_values(hFILE_s3 *fp) {
+    ks_clear(&fp->content_hash);
+    ks_clear(&fp->authorisation);
+    ks_clear(&fp->content);
+    ks_clear(&fp->date);
+    ks_clear(&fp->token);
+    ks_clear(&fp->range);
+}
+
+
+static void free_authorisation_values(hFILE_s3 *fp) {
+    ks_free(&fp->content_hash);
+    ks_free(&fp->authorisation);
+    ks_free(&fp->content);
+    ks_free(&fp->date);
+    ks_free(&fp->token);
+    ks_free(&fp->range);
+}
+
 
 static size_t response_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -1349,12 +1420,13 @@ static void cleanup_local(hFILE_s3 *fp) {
     ks_free(&fp->upload_id);
     ks_free(&fp->completion_message);
     curl_easy_cleanup(fp->curl);
+    free_authorisation_values(fp);
 }
 
 
 static void cleanup(hFILE_s3 *fp) {
     // free up authorisation data
-    v4_authorisation((void *)fp->au,  NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0);
+    v4_authorisation(fp, NULL, NULL, 0);
     cleanup_local(fp);
 }
 
@@ -1363,24 +1435,19 @@ static void cleanup(hFILE_s3 *fp) {
     The partially uploaded file will hang around unless the delete command is sent.
 */
 static int abort_upload(hFILE_s3 *fp) {
-    kstring_t content_hash = {0, 0, NULL};
-    kstring_t authorisation = {0, 0, NULL};
-    kstring_t url = {0, 0, NULL};
-    kstring_t content = {0, 0, NULL};
-    kstring_t canonical_query_string = {0, 0, NULL};
-    kstring_t date = {0, 0, NULL};
-    kstring_t token = {0, 0, NULL};
+    kstring_t url = KS_INITIALIZE;
+    kstring_t canonical_query_string = KS_INITIALIZE;
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "DELETE";
+    
+    clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
         goto out;
     }
 
-    if (v4_authorisation((void *)fp->au,  http_request, NULL,
-                         canonical_query_string.s, &content_hash,
-                         &authorisation, &date, &token, 0) != 0) {
+    if (v4_authorisation(fp,  http_request, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1388,7 +1455,7 @@ static int abort_upload(hFILE_s3 *fp) {
         goto out;
     }
 
-    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
         goto out;
     }
 
@@ -1399,7 +1466,7 @@ static int abort_upload(hFILE_s3 *fp) {
 
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    headers = set_html_headers(fp, &fp->authorisation, &fp->date, &fp->content, &fp->token, NULL);
     fp->ret = curl_easy_perform(fp->curl);
 
     if (fp->ret == CURLE_OK) {
@@ -1407,13 +1474,8 @@ static int abort_upload(hFILE_s3 *fp) {
     }
 
  out:
-    ks_free(&authorisation);
-    ks_free(&content);
-    ks_free(&content_hash);
     ks_free(&url);
-    ks_free(&date);
     ks_free(&canonical_query_string);
-    ks_free(&token);
     curl_slist_free_all(headers);
 
     fp->aborted = 1;
@@ -1424,16 +1486,13 @@ static int abort_upload(hFILE_s3 *fp) {
 
 
 static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
-    kstring_t content_hash = {0, 0, NULL};
-    kstring_t authorisation = {0, 0, NULL};
-    kstring_t url = {0, 0, NULL};
-    kstring_t content = {0, 0, NULL};
-    kstring_t canonical_query_string = {0, 0, NULL};
-    kstring_t date = {0, 0, NULL};
-    kstring_t token = {0, 0, NULL};
+    kstring_t url = KS_INITIALIZE;
+    kstring_t canonical_query_string = KS_INITIALIZE;
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "POST";
+    
+    clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
         return -1;
@@ -1444,9 +1503,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
         goto out;
     }
 
-    if (v4_authorisation((void *)fp->au,  http_request,
-                         &fp->completion_message, canonical_query_string.s,
-                         &content_hash, &authorisation, &date, &token, 0) != 0) {
+    if (v4_authorisation(fp,  http_request, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1454,7 +1511,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
         goto out;
     }
 
-    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
         goto out;
     }
 
@@ -1469,7 +1526,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
 
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    headers = set_html_headers(fp, &fp->authorisation, &fp->date, &fp->content, &fp->token, NULL);
     fp->ret = curl_easy_perform(fp->curl);
 
     if (fp->ret == CURLE_OK) {
@@ -1477,12 +1534,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
     }
 
  out:
-    ks_free(&authorisation);
-    ks_free(&content);
-    ks_free(&content_hash);
     ks_free(&url);
-    ks_free(&date);
-    ks_free(&token);
     ks_free(&canonical_query_string);
     curl_slist_free_all(headers);
 
@@ -1509,24 +1561,19 @@ static size_t upload_callback(void *ptr, size_t size, size_t nmemb, void *stream
 
 
 static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
-    kstring_t content_hash = {0, 0, NULL};
-    kstring_t authorisation = {0, 0, NULL};
-    kstring_t url = {0, 0, NULL};
-    kstring_t content = {0, 0, NULL};
-    kstring_t canonical_query_string = {0, 0, NULL};
-    kstring_t date = {0, 0, NULL};
-    kstring_t token = {0, 0, NULL};
+    kstring_t url = KS_INITIALIZE;
+    kstring_t canonical_query_string = KS_INITIALIZE;
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "PUT";
+    
+    clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "partNumber=%d&uploadId=%s", fp->part_no, fp->upload_id.s) < 0) {
         return -1;
     }
 
-    if (v4_authorisation((void *)fp->au, http_request, &fp->buffer,
-                         canonical_query_string.s, &content_hash,
-                         &authorisation, &date, &token, 0) != 0) {
+    if (v4_authorisation(fp, http_request, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1535,7 +1582,7 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
     }
 
     fp->index = 0;
-    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
         goto out;
     }
 
@@ -1552,7 +1599,7 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
 
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    headers = set_html_headers(fp, &fp->authorisation, &fp->date, &fp->content, &fp->token, NULL);
     fp->ret = curl_easy_perform(fp->curl);
 
     if (fp->ret == CURLE_OK) {
@@ -1560,12 +1607,7 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
     }
 
  out:
-    ks_free(&authorisation);
-    ks_free(&content);
-    ks_free(&content_hash);
     ks_free(&url);
-    ks_free(&date);
-    ks_free(&token);
     ks_free(&canonical_query_string);
     curl_slist_free_all(headers);
 
@@ -1719,23 +1761,19 @@ static int handle_bad_request(hFILE_s3 *fp, kstring_t *resp) {
 }
 
 static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int user_query) {
-    kstring_t content_hash = {0, 0, NULL};
-    kstring_t authorisation = {0, 0, NULL};
-    kstring_t url = {0, 0, NULL};
-    kstring_t content = {0, 0, NULL};
-    kstring_t date = {0, 0, NULL};
-    kstring_t token = {0, 0, NULL};
+    kstring_t url = KS_INITIALIZE;
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "POST";
     char delimiter = '?';
+    
+    clear_authorisation_values(fp);
 
     if (user_query) {
         delimiter = '&';
     }
 
-    if (v4_authorisation((void *)fp->au,  http_request, NULL, "uploads=",
-                         &content_hash, &authorisation, &date, &token, user_query) != 0) {
+    if (v4_authorisation(fp, http_request, "uploads=", user_query) != 0) {
         goto out;
     }
 
@@ -1743,7 +1781,7 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
         goto out;
     }
 
-    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
         goto out;
     }
 
@@ -1758,7 +1796,7 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
 
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content, &token, NULL);
+    headers = set_html_headers(fp, &fp->authorisation, &fp->date, &fp->content, &fp->token, NULL);
     fp->ret = curl_easy_perform(fp->curl);
 
     if (fp->ret == CURLE_OK) {
@@ -1766,13 +1804,8 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
     }
 
  out:
-    ks_free(&authorisation);
-    ks_free(&content);
-    ks_free(&content_hash);
-    ks_free(&url);
-    ks_free(&date);
-    ks_free(&token);
     curl_slist_free_all(headers);
+    ks_free(&url);
 
     return ret;
 }
@@ -1825,12 +1858,6 @@ static int s3_read_close(hFILE *fpv) {
 
 
 static int get_part(hFILE_s3 *fp, kstring_t *resp) {
-    kstring_t content_hash = KS_INITIALIZE;
-    kstring_t authorisation = KS_INITIALIZE;
-    kstring_t content = KS_INITIALIZE;
-    kstring_t date = KS_INITIALIZE;
-    kstring_t token = KS_INITIALIZE;
-    kstring_t range = KS_INITIALIZE;
     struct curl_slist *headers = NULL;
     int ret = -1;
     char http_request[] = "GET";
@@ -1839,28 +1866,25 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
     if (hts_verbose > 5) fprintf(stderr, "get_part\n");
 
     ks_clear(&fp->buffer); // reset storage buffer
+    clear_authorisation_values(fp);
 
-
-    // FIXME - unnecessary void cast
-    if (v4_authorisation((void *)fp->au, http_request, NULL,
-                         &canonical_query_string, &content_hash,
-                         &authorisation, &date, &token, 0) != 0) {
+    if (v4_authorisation(fp, http_request, &canonical_query_string, 0) != 0) {
         goto out;
     }
 
     if (hts_verbose > 5) fprintf(stderr, "get_part auth done\n");
 
-    if (ksprintf(&content, "x-amz-content-sha256: %s", content_hash.s) < 0) {
+    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
         goto out;
     }
 
     if (hts_verbose > 5) fprintf(stderr, "get_part content set\n");
 
-    if (ksprintf(&range, "Range: bytes=%zu-%zu", fp->last_read, fp->last_read + fp->part_size - 1) < 0) {
+    if (ksprintf(&fp->range, "Range: bytes=%zu-%zu", fp->last_read, fp->last_read + fp->part_size - 1) < 0) {
         goto out;
     }
 
-    if (hts_verbose > 5) fprintf(stderr, "get_part range set %s\n", range.s);
+    if (hts_verbose > 5) fprintf(stderr, "get_part range set %s\n", fp->range.s);
     
     if (hts_verbose > 5) fprintf(stderr, "get_part url %s\n", fp->url.s);
 
@@ -1875,7 +1899,7 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
 
     curl_easy_setopt(fp->curl, CURLOPT_VERBOSE, fp->verbose);
 
-    headers = set_html_headers(fp, &authorisation, &date, &content, &token, &range);
+    headers = set_html_headers(fp, &fp->authorisation, &fp->date, &fp->content, &fp->token, &fp->range);
     fp->ret = curl_easy_perform(fp->curl);
 
     if (fp->ret == CURLE_OK) {
@@ -1885,12 +1909,6 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
     if (hts_verbose > 5) fprintf(stderr, "get_part ret %d\n", ret);
 
  out:
-    ks_free(&authorisation);
-    ks_free(&content);
-    ks_free(&content_hash);
-    ks_free(&date);
-    ks_free(&range);
-    ks_free(&token);
     curl_slist_free_all(headers);
 
     return ret;
@@ -2074,6 +2092,7 @@ static hFILE *s3_write_open(const char *url, s3_auth_data *auth) {
     fp->au = auth;
 
     initialise_local(fp);
+    initialise_authorisation_values(fp);
     fp->aborted = 0;
     fp->part_size = MINIMUM_S3_WRITE_SIZE;
     fp->expand = 1;
@@ -2149,6 +2168,7 @@ static hFILE *s3_write_open(const char *url, s3_auth_data *auth) {
 error:
     ks_free(&response);
     cleanup_local(fp);
+    free_authorisation_values(fp);
     hfile_destroy((hFILE *)fp);
     return NULL;
 }
@@ -2175,6 +2195,8 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
     fp->au = auth;
 
     initialise_local(fp);
+    initialise_authorisation_values(fp);
+
     fp->last_read = 0; // ranges start at 0
     fp->write = 0;
 
@@ -2253,6 +2275,7 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
     ks_free(&response);
     ks_free(&file_range);
     cleanup_local(fp);
+    free_authorisation_values(fp);
     hfile_destroy((hFILE *)fp);
     return NULL;
 }
