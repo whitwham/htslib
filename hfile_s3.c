@@ -66,7 +66,42 @@ typedef struct s3_auth_data {
     char mode;
     char *headers[5];
     int refcount;
+    int is_v4;
 } s3_auth_data;
+
+typedef struct {
+    hFILE base;
+    CURL *curl;
+    CURLcode ret;
+    s3_auth_data *au;
+    kstring_t buffer;
+    kstring_t url;
+    long verbose;
+    int write;
+    int part_size; // size for reading or writing
+
+    kstring_t content_hash;
+    kstring_t authorisation;
+    kstring_t content;
+    kstring_t date;
+    kstring_t token;
+    kstring_t range;
+
+    // write variables
+    kstring_t upload_id;
+    kstring_t completion_message;
+    int part_no;
+    int aborted;
+    size_t index;
+    int expand;
+
+    // read variables
+    size_t last_read;               // last read position (remote)
+    size_t last_read_buffer;        // last read (local buffer)
+    size_t file_size;               // size of the file being read
+    int keep_going;
+
+} hFILE_s3;
 
 #define AUTH_LIFETIME 60  // Regenerate auth headers if older than this
 #define CREDENTIAL_LIFETIME 60 // Seconds before expiry to reread credentials
@@ -279,6 +314,7 @@ static void parse_simple(const char *fname, kstring_t *id, kstring_t *secret)
     free(text.s);
 }
 
+/*
 static int copy_auth_headers(s3_auth_data *ad, char ***hdrs) {
     char **hdr = &ad->headers[0];
     int idx = 0;
@@ -313,6 +349,8 @@ static int copy_auth_headers(s3_auth_data *ad, char ***hdrs) {
         free(hdr[idx]);
     return -1;
 }
+*/
+
 
 static void free_auth_data(s3_auth_data *ad) {
     if (ad->refcount > 0) {
@@ -394,7 +432,7 @@ static void refresh_auth_data(s3_auth_data *ad) {
     ks_free(&expiry_time);
 }
 
-/* 
+/*
 static int auth_header_callback(void *ctx, char ***hdrs) {
     s3_auth_data *ad = (s3_auth_data *) ctx;
 
@@ -799,6 +837,7 @@ static s3_auth_data * setup_auth_data(const char *s3url, const char *mode,
             goto error;
         }
         memcpy(ad->bucket, url->s + url_path_pos, url->l - url_path_pos + 1);
+        ad->is_v4 = 1;
     }
     else {
         ad->bucket = malloc(url->l - url_path_pos + bucket_len + 2);
@@ -809,6 +848,7 @@ static s3_auth_data * setup_auth_data(const char *s3url, const char *mode,
         memcpy(ad->bucket + 1, bucket, bucket_len);
         memcpy(ad->bucket + bucket_len + 1,
                url->s + url_path_pos, url->l - url_path_pos + 1);
+        ad->is_v4 = 0;
     }
 
     // write any query strings to its own place to use later
@@ -838,26 +878,56 @@ static int v2_authorisation(hFILE_s3 *fp, char *request) {
 #else
     struct tm *tm = gmtime(&now);
 #endif
-        
+
+    kstring_t message = KS_INITIALIZE;
+    unsigned char digest[DIGEST_BUFSIZ];
+    size_t digest_len;
+
     if (request == NULL) { // FIXME - probably does not need to be like this anymore
         // signal to free auth data
         free_auth_data(ad);
         return 0;
     }
-       
+
     if (ad->creds_expiry_time > 0
         && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
         refresh_auth_data(ad);
     }
-    
+
     // date format between v2 and v4 is different.
-    
+
     strftime(ad->date, sizeof(ad->date), "Date: %a, %d %b %Y %H:%M:%S GMT", tm);
 
+    kputs(ad->date, &fp->date);
 
- 
+    if (!ad->id.l || !ad->secret.l) {
+        ad->auth_time = now;
+        return 0; // FIXME - Check that this is right.
+    }
 
+    if (ksprintf(&message, "%s\n\n\n%s\n%s%s%s%s",
+                 request, ad->date + 6,
+                 ad->token.l ? "x-amz-security-token:" : "",
+                 ad->token.l ? ad->token.s : "",
+                 ad->token.l ? "\n" : "",
+                 ad->bucket) < 0) {
+        return -1;
+    }
 
+    digest_len = s3_sign(digest, &ad->secret, &message);
+
+    if (ksprintf(&fp->authorisation, "Authorization: AWS %s:", ad->id.s) < 0)
+        goto fail;
+
+    base64_kput(digest, digest_len, &fp->authorisation);
+
+    free(message.s);
+    ad->auth_time = now;
+    return 0;
+
+ fail:
+    free(message.s);
+    return -1;
 }
 
 /*static hFILE * s3_rewrite(const char *s3url, const char *mode, va_list *argsp)
@@ -948,7 +1018,7 @@ static int make_authorisation(s3_auth_data *ad, char *http_request, char *conten
     char cr_hash[HASH_LENGTH_SHA256];
     char signature_string[HASH_LENGTH_SHA256];
     int ret = -1;
-    
+
     if (!ad->id.l || !ad->secret.l) {
         return 0;
     }
@@ -1110,42 +1180,7 @@ static int order_query_string(kstring_t *qs) {
 }
 
 
-typedef struct {
-    hFILE base;
-    CURL *curl;
-    CURLcode ret;
-    s3_auth_data *au;
-    kstring_t buffer;
-    kstring_t url;
-    long verbose;
-    int write;
-    int part_size; // size for reading or writing
-    
-    kstring_t content_hash;
-    kstring_t authorisation;
-    kstring_t content;
-    kstring_t date;
-    kstring_t token;
-    kstring_t range;
-    
-    // write variables
-    kstring_t upload_id;
-    kstring_t completion_message;
-    int part_no;
-    int aborted;
-    size_t index;
-    int expand;
-
-    // read variables
-    size_t last_read;               // last read position (remote)
-    size_t last_read_buffer;        // last read (local buffer)
-    size_t file_size;               // size of the file being read
-    int keep_going;
-
-} hFILE_s3;
-
-
-static int v4_authorisation(hFILE_s3 *fp, char *request, char *cqs, int uqs) {
+static int v4_authorisation(hFILE_s3 *fp, char *request, kstring_t *content, char *cqs, int uqs) {
     s3_auth_data *ad = fp->au;
     char content_hash[HASH_LENGTH_SHA256];
     time_t now;
@@ -1161,14 +1196,14 @@ static int v4_authorisation(hFILE_s3 *fp, char *request, char *cqs, int uqs) {
     if (update_time(ad, now)) {
         return -1;
     }
-    
+
     if (ad->creds_expiry_time > 0
         && ad->creds_expiry_time - now < CREDENTIAL_LIFETIME) {
         refresh_auth_data(ad);
     }
-    
-    if (fp->content.l) {
-        hash_string(fp->content.s, fp->content.l, content_hash, sizeof(content_hash));
+
+    if (content) {
+        hash_string(content->s, content->l, content_hash, sizeof(content_hash));
     } else {
         // empty hash
         hash_string("", 0, content_hash, sizeof(content_hash));
@@ -1201,7 +1236,7 @@ static int v4_authorisation(hFILE_s3 *fp, char *request, char *cqs, int uqs) {
     kputs(ad->date_html.s, &fp->date);
     kputsn(content_hash, HASH_LENGTH_SHA256, &fp->content_hash);
 
-    if (fp->date.l == 0 || &fp->content_hash.l == 0) {
+    if (fp->date.l == 0 || fp->content_hash.l == 0) {
         return -1;
     }
 
@@ -1289,11 +1324,13 @@ static struct curl_slist *set_html_headers(hFILE_s3 *fp, kstring_t *auth, kstrin
                  kstring_t *content, kstring_t *token, kstring_t *range) {
     struct curl_slist *headers = NULL;
 
-    if (auth->l) 
+    if (auth->l)
         headers = curl_slist_append(headers, auth->s);
-        
+
     headers = curl_slist_append(headers, date->s);
-    headers = curl_slist_append(headers, content->s);
+
+    if (content->l)
+        headers = curl_slist_append(headers, content->s);
 
     if (range) {
         headers = curl_slist_append(headers, range->s);
@@ -1426,7 +1463,7 @@ static void cleanup_local(hFILE_s3 *fp) {
 
 static void cleanup(hFILE_s3 *fp) {
     // free up authorisation data
-    v4_authorisation(fp, NULL, NULL, 0);
+    v4_authorisation(fp, NULL, NULL, NULL, 0);
     cleanup_local(fp);
 }
 
@@ -1440,14 +1477,14 @@ static int abort_upload(hFILE_s3 *fp) {
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "DELETE";
-    
+
     clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
         goto out;
     }
 
-    if (v4_authorisation(fp,  http_request, canonical_query_string.s, 0) != 0) {
+    if (v4_authorisation(fp,  http_request, NULL, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1491,7 +1528,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "POST";
-    
+
     clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "uploadId=%s", fp->upload_id.s) < 0) {
@@ -1503,7 +1540,7 @@ static int complete_upload(hFILE_s3 *fp, kstring_t *resp) {
         goto out;
     }
 
-    if (v4_authorisation(fp,  http_request, canonical_query_string.s, 0) != 0) {
+    if (v4_authorisation(fp,  http_request, &fp->completion_message, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1566,14 +1603,14 @@ static int upload_part(hFILE_s3 *fp, kstring_t *resp) {
     int ret = -1;
     struct curl_slist *headers = NULL;
     char http_request[] = "PUT";
-    
+
     clear_authorisation_values(fp);
 
     if (ksprintf(&canonical_query_string, "partNumber=%d&uploadId=%s", fp->part_no, fp->upload_id.s) < 0) {
         return -1;
     }
 
-    if (v4_authorisation(fp, http_request, canonical_query_string.s, 0) != 0) {
+    if (v4_authorisation(fp, http_request, &fp->buffer, canonical_query_string.s, 0) != 0) {
         goto out;
     }
 
@@ -1766,14 +1803,14 @@ static int initialise_upload(hFILE_s3 *fp, kstring_t *head, kstring_t *resp, int
     struct curl_slist *headers = NULL;
     char http_request[] = "POST";
     char delimiter = '?';
-    
+
     clear_authorisation_values(fp);
 
     if (user_query) {
         delimiter = '&';
     }
 
-    if (v4_authorisation(fp, http_request, "uploads=", user_query) != 0) {
+    if (v4_authorisation(fp, http_request, NULL, "uploads=", user_query) != 0) {
         goto out;
     }
 
@@ -1835,8 +1872,6 @@ static size_t recv_callback(char *ptr, size_t size, size_t nmemb, void *fpv) {
     hFILE_s3 *fp = (hFILE_s3 *) fpv;
     size_t n = size * nmemb;
 
-    // fprintf(stderr, "recv n %ld\n", n);
-
     if (n) {
         if (kputsn(ptr, n, &fp->buffer) == EOF) {
             return 0; // FIX ME - error message
@@ -1868,24 +1903,34 @@ static int get_part(hFILE_s3 *fp, kstring_t *resp) {
     ks_clear(&fp->buffer); // reset storage buffer
     clear_authorisation_values(fp);
 
-    if (v4_authorisation(fp, http_request, &canonical_query_string, 0) != 0) {
-        goto out;
+
+    if (fp->au->is_v4) {
+        if (v4_authorisation(fp, http_request, NULL, &canonical_query_string, 0) != 0) {
+            goto out;
+        }
+
+        if (hts_verbose > 5) fprintf(stderr, "get_part v4 auth done\n");
+
+        if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
+            goto out;
+        }
+
+        if (hts_verbose > 5) fprintf(stderr, "get_part content set\n");
+
+    } else {
+        if (v2_authorisation(fp, http_request) != 0) {
+            goto out;
+        }
+
+        if (hts_verbose > 5) fprintf(stderr, "get_part v2 auth done\n");
     }
-
-    if (hts_verbose > 5) fprintf(stderr, "get_part auth done\n");
-
-    if (ksprintf(&fp->content, "x-amz-content-sha256: %s", fp->content_hash.s) < 0) {
-        goto out;
-    }
-
-    if (hts_verbose > 5) fprintf(stderr, "get_part content set\n");
 
     if (ksprintf(&fp->range, "Range: bytes=%zu-%zu", fp->last_read, fp->last_read + fp->part_size - 1) < 0) {
         goto out;
     }
 
     if (hts_verbose > 5) fprintf(stderr, "get_part range set %s\n", fp->range.s);
-    
+
     if (hts_verbose > 5) fprintf(stderr, "get_part url %s\n", fp->url.s);
 
     curl_easy_reset(fp->curl);
@@ -1928,7 +1973,7 @@ static ssize_t s3_read(hFILE *fpv, void *bufferv, size_t nbytes) {
     */
 
     if (hts_verbose > 5) fprintf(stderr, "s3_read keep_going %d read %zu nbytes %zu\n", fp->keep_going, read, nbytes);
-    
+
     while (fp->keep_going && read < nbytes) {
         if (hts_verbose > 5) fprintf(stderr, "read  %zu nbytes %zu\n", read, nbytes);
 
@@ -1988,16 +2033,13 @@ static ssize_t s3_read(hFILE *fpv, void *bufferv, size_t nbytes) {
 static off_t s3_seek(hFILE *fpv, off_t offset, int whence) {
     hFILE_s3 *fp = (hFILE_s3 *)fpv;
     off_t origin;
-    
-    fprintf(stderr, "seeking offset %ld whence %d\n", offset, whence);
 
     if (fp->write) {
         // lets not try and seek while writing
         errno = ESPIPE;
         return -1;
     }
-    
-    fprintf(stderr, "seeking pre choice\n");
+
     // I am not sure we handle any seek other than one from the beginning
     switch (whence) {
         case SEEK_SET:
@@ -2012,15 +2054,14 @@ static off_t s3_seek(hFILE *fpv, off_t offset, int whence) {
                 errno = ESPIPE;
                 return -1;
             }
-            
+
             origin = fp->file_size;
             break;
         default:
             errno = EINVAL;
             return -1;
     }
-    
-    fprintf(stderr, "seeking here\n");
+
     // Check 0 <= origin+offset < fp->file_size carefully, avoiding overflow
     if ((offset < 0)? origin + offset < 0
                 : (fp->file_size >= 0 && offset > fp->file_size - origin)) {
@@ -2031,7 +2072,6 @@ static off_t s3_seek(hFILE *fpv, off_t offset, int whence) {
     fp->keep_going = 1;
     fp->last_read = origin + offset; // origin is really only useful if we can make the other modes work
     ks_clear(&fp->buffer); // resetting fp->buffer triggers a new remote read
-    fprintf(stderr, "Cleared buffer length %ld\n", fp->buffer.l);
 
     return fp->last_read;
 }
@@ -2226,8 +2266,6 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
                 ret = initialise_download(fp, &response);
             }
         } else if (response_code == S3_BAD_REQUEST) {
-            fprintf(stderr, "BAD REQUEST!!!\n");
-
             if (hts_verbose > 5) fprintf(stderr, "%s\n", fp->buffer.s);
 
             if (handle_bad_request(fp, &fp->buffer) == 0) {
@@ -2251,9 +2289,7 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
     } else {
         char *s;
         if ((s = strchr(file_range.s, '/'))) {
-            fprintf(stderr, "\nfile_range %s\n", file_range.s);
             fp->file_size = strtoll(s + 1, NULL, 10);
-            fprintf(stderr, "Final size %zu\n", fp->file_size);
         } else {
             fp->file_size = -1;
         }
@@ -2289,21 +2325,21 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
 
 // static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
 //     kstring_t url = { 0, 0, NULL };
-// 
+//
 //     s3_auth_data *ad = setup_auth_data(s3url, mode, 4, &url);
 //     hFILE *fp = NULL;
-// 
+//
 //     if (ad == NULL) {
 //         return NULL;
 //     }
-// 
+//
 //     kstring_t final_url = KS_INITIALIZE;
-// 
+//
 //      // add the scheme marker
 //     ksprintf(&final_url, "s3rw+%s", url.s);
-// 
+//
 //     if(final_url.l == 0) goto error;
-// 
+//
 //     fp = hopen(final_url.s, mode, "va_list", argsp,
 //                "s3_auth_callback",  write_authorisation_callback,
 //                "s3_auth_callback_data", ad,
@@ -2311,44 +2347,44 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
 //                "set_region_callback", set_region,
 //                NULL);
 //     free(final_url.s);
-// 
+//
 //     if (fp == NULL) goto error;
-// 
+//
 //     free(url.s);
-// 
+//
 //     return fp;
-// 
+//
 //   error:
-// 
+//
 //     if (fp) hclose_abruptly(fp);
 //     free(url.s);
 //     free_auth_data(ad);
-// 
+//
 //     return NULL;
 // }
-// 
-// 
+//
+//
 // static hFILE *s3_open(const char *url, const char *mode)
 // {
 //     hFILE *fp;
-// 
+//
 //     fprintf(stderr, "s3_open\n");
-// 
+//
 //     kstring_t mode_colon = { 0, 0, NULL };
 //     kputs(mode, &mode_colon);
 //     kputc(':', &mode_colon);
-// 
+//
 //     if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
 //         fp = s3_open_v4(url, mode_colon.s, NULL);
 //     } else {
 //         fp = s3_rewrite(url, mode_colon.s, NULL);
 //     }
-// 
+//
 //     free(mode_colon.s);
-// 
+//
 //     return fp;
 // }
-// 
+//
 // static hFILE *s3_vopen(const char *url, const char *mode_colon, va_list args0)
 // {
 //     hFILE *fp;
@@ -2356,25 +2392,25 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
 //     // va_list object, not that of a parameter whose type may have decayed.
 //     va_list args;
 //     va_copy(args, args0);
-// 
+//
 //     fprintf(stderr, "s3_vopen\n");
 //     printf("HELLO WORLD!");
-// 
+//
 //     if (getenv("HTS_S3_V2") == NULL) { // Force the v2 signature code
 //         fp = s3_open_v4(url, mode_colon, &args);
 //     } else {
 //         fp = s3_rewrite(url, mode_colon, &args);
 //     }
-// 
+//
 //     va_end(args);
 //     return fp;
 // }
-// 
-// 
+//
+//
 // static hFILE *vhopen_s3(const char *url, const char *mode, va_list args) {
 //     hFILE *fp = NULL;
 //     s3_authorisation auth = {NULL, NULL, NULL};
-// 
+//
 //     if (parse_va_list(&auth, args) == 0) {
 //         if (*mode == 'r') {
 //             fp  = s3_read_open(url, &auth);
@@ -2382,7 +2418,7 @@ static hFILE *s3_read_open(const char *url, s3_auth_data *auth) {
 //             fp =  s3_write_open(url, &auth);
 //         }
 //     }
-// 
+//
 //     return fp;
 // }
 
@@ -2396,27 +2432,44 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     if (ad == NULL) {
         return NULL;
     }
-    
+
     if (hts_verbose > 5) fprintf(stderr, "s3_open_v4 url %s\n", url.s);
-    
+
     if (*mode == 'r') {
         fp  = s3_read_open(url.s, ad);
     } else {
         fp =  s3_write_open(url.s, ad);
     }
-    
+
     ks_free(&url);
-    
+
     return fp;
 }
 
-static hFILE *s3_open_v2(const char *s3url, const char *mode, va_list *argsp) { 
-    fprintf(stderr, "Auth V2 NOT DONE YET\n");
-    
-    return NULL;
+static hFILE *s3_open_v2(const char *s3url, const char *mode, va_list *argsp) {
+    kstring_t url = { 0, 0, NULL };
+
+    s3_auth_data *ad = setup_auth_data(s3url, mode, 2, &url);
+    hFILE *fp = NULL;
+
+    if (ad == NULL) {
+        return NULL;
+    }
+
+    if (hts_verbose > 5) fprintf(stderr, "s3_open_v2 url %s\n", url.s);
+
+    if (*mode == 'r') {
+        fp  = s3_read_open(url.s, ad);
+    } else {
+        fprintf(stderr, "Error: signature v2 not handled for writing.\n.");
+    }
+
+    ks_free(&url);
+
+    return fp;
 }
 
-  
+
 static hFILE *hopen_s3(const char *url, const char *mode)
 {
     hFILE *fp;
@@ -2436,12 +2489,12 @@ static hFILE *hopen_s3(const char *url, const char *mode)
 static hFILE *vhopen_s3(const char *url, const char *mode, va_list args0)
 {
     hFILE *fp;
-    
+
     // This should handle to vargs case.  Not sure what vargs we want
     // to handle
 
     fprintf(stderr, "vhopen\n");
-    
+
     fp = hopen_s3(url, mode);
 
     return fp;
