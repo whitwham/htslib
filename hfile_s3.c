@@ -98,7 +98,7 @@ typedef struct {
     // read variables
     size_t last_read;               // last read position (remote)
     size_t last_read_buffer;        // last read (local buffer)
-    size_t file_size;               // size of the file being read
+    int64_t file_size;              // size of the file being read
     int keep_going;
 
 } hFILE_s3;
