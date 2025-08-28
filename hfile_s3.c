@@ -2442,6 +2442,8 @@ static hFILE *s3_open_v4(const char *s3url, const char *mode, va_list *argsp) {
     }
 
     ks_free(&url);
+    if (!fp)
+        free_auth_data(ad);
 
     return fp;
 }
@@ -2465,6 +2467,8 @@ static hFILE *s3_open_v2(const char *s3url, const char *mode, va_list *argsp) {
     }
 
     ks_free(&url);
+    if (!fp)
+        free_auth_data(ad);
 
     return fp;
 }
